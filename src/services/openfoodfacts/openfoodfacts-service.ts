@@ -17,11 +17,18 @@ import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import { ANALYZER_STOP_WORDS, STOP_WORD_LANGS } from './analyzer-stop-words.js';
 import {
   BARCODE_PATTERN,
+  type IndexedNutriments,
+  indexedNutrientKey,
+  type NutrientField,
   type NutrientOperator,
   type RawAutocompleteResponse,
+  type RawNutriments,
   type RawProduct,
   type RawProductResponse,
+  type RawSearchProduct,
   type RawSearchResponse,
+  type RawTaxonomyOption,
+  type RawTextSearchHit,
   type RawTextSearchResponse,
   type SearchParams,
   type SearchResult,
@@ -219,21 +226,96 @@ function publishedErrorData(data: Record<string, unknown> | undefined): Record<s
 /**
  * Parses a 2xx body as JSON, catching the rendered error page Open Food Facts serves with a 200
  * under load. The body is read exactly once — reading it as text to sniff for markup and then
- * calling `response.json()` would fail on the already-consumed stream.
+ * calling `response.json()` would fail on the already-consumed stream. A body that does not parse
+ * is the same retryable `upstream_error`: left as a bare `SyntaxError`, it reached the caller as a
+ * `ValidationError` naming no reason, as though the caller's input were at fault.
  */
 async function parseJsonBody<T>(response: Response, data: Record<string, unknown>): Promise<T> {
-  if ((response.headers.get('content-type') ?? '').includes('application/json')) {
-    return (await response.json()) as T;
-  }
-  const body = await response.text();
-  if (looksLikeHtml(body)) {
+  const isJson = (response.headers.get('content-type') ?? '').includes('application/json');
+  const body = isJson ? undefined : await response.text();
+  if (body !== undefined && looksLikeHtml(body)) {
     throw contractError(
       'upstream_error',
       'Open Food Facts served an HTML page instead of JSON — the service is rate-limiting or temporarily down.',
       data,
     );
   }
-  return JSON.parse(body) as T;
+  try {
+    return (body === undefined ? await response.json() : JSON.parse(body)) as T;
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw contractError(
+      'upstream_error',
+      'Open Food Facts answered with a body that is not valid JSON — the service is likely degraded.',
+      data,
+      error,
+    );
+  }
+}
+
+/** A JSON object — not `null`, not an array. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The failure for a 2xx body that parses as JSON but fails its read's envelope rule — the result
+ * fields every genuine answer carries are missing or mistyped. Read as an answer, such a body
+ * becomes a factual absence: a product "not found", a search with zero matches, a term with no
+ * tag. Product Opener sends exactly that shape when its database query fails (its search response
+ * gains `count` only after the query succeeds), so it is the retryable `upstream_error`, raised
+ * inside the retry boundary like an HTML page served with a 200.
+ */
+function malformedEnvelope(
+  read: string,
+  expected: string,
+  data: Record<string, unknown>,
+): McpError {
+  return contractError(
+    'upstream_error',
+    `Open Food Facts answered the ${read} with a malformed response (expected ${expected}) — the service is likely degraded.`,
+    data,
+  );
+}
+
+/**
+ * A product lookup's answer: not found (`status: 0`), or found (`status: 1`) with a product
+ * object — `{}` included, which is a found product with nothing entered for the requested fields.
+ */
+function isProductEnvelope(
+  body: unknown,
+): body is RawProductResponse & ({ status: 0 } | { status: 1; product: RawProduct }) {
+  return isRecord(body) && (body.status === 0 || (body.status === 1 && isRecord(body.product)));
+}
+
+/** A tag search's answer: a `products` list and a numeric `count`, zero for no matches. */
+function isTagSearchEnvelope(
+  body: unknown,
+): body is RawSearchResponse & { count: number; products: RawSearchProduct[] } {
+  return isRecord(body) && Array.isArray(body.products) && Number.isFinite(body.count);
+}
+
+/**
+ * A text search's answer: a `hits` list, a numeric `count`, and the boolean `is_count_exact` —
+ * all three required by search-a-licious's success schema and present in every live answer.
+ */
+function isTextSearchEnvelope(body: RawTextSearchResponse): body is RawTextSearchResponse & {
+  count: number;
+  hits: RawTextSearchHit[];
+  is_count_exact: boolean;
+} {
+  return (
+    Array.isArray(body.hits) &&
+    Number.isFinite(body.count) &&
+    typeof body.is_count_exact === 'boolean'
+  );
+}
+
+/** An autocomplete answer: an `options` list, empty when nothing matched. */
+function isAutocompleteEnvelope(
+  body: unknown,
+): body is RawAutocompleteResponse & { options: RawTaxonomyOption[] } {
+  return isRecord(body) && Array.isArray(body.options);
 }
 
 /**
@@ -429,23 +511,41 @@ const STOP_WORDS = new Set(
 );
 
 /**
- * The words of a lowercased query that each get a required group: whitespace-separated, holding a
- * letter or digit, not an exempt stop word (see `STOP_WORDS`), first occurrence only. A token with
- * no letter or digit analyzes to nothing in every field, and a fielded match on nothing matches no
- * product (live: `milk -` with a group for `-` → 0, without it → 6), so it forms no group.
- *
- * A query of one token gets none: the backend's relevance match already requires at least one of
- * its terms (it sets `minimum_should_match: 1` beside filters, and a should-only query needs one
- * anyway), so a lone word's group selects the same products (live: `milk` 6 with or without it)
- * while costing about 200 ms a search.
+ * A word as the backend's analyzers split text: a run of letters, marks, digits, and `_`,
+ * continuing across a single `'`, `’`, or `.` between two such characters, or a single `,` between
+ * two digits; every other character separates words. Probed live (2026-10-13, Mongolia): one group
+ * for `milk<sep>xyzzyqq` matched the 6 `milk` products when `<sep>` was `-`, `/`, `+`, `&`, `,`,
+ * or `:` — the analyzer split it and the group ORed the parts — and 0 when it was `'`, `’`, `.`, or
+ * `_`, which stay inside one token. A decimal comma stays inside its number (live: `lait 1,5%` with
+ * groups for `1` and `5` matched 27 products, only names spelling it `1, 5%`; with one `1,5` group,
+ * 324). The scan is linear in the query's length, which nothing bounds before it: the joiners and
+ * the word characters are disjoint and a started match always succeeds, so nothing is retried.
  */
-function requiredWords(lowercasedQuery: string): string[] {
-  const tokens = lowercasedQuery.split(/\s+/).filter((token) => token !== '');
-  if (tokens.length < 2) return [];
-  const words = tokens.filter(
-    (word) => /[\p{L}\p{N}]/u.test(word) && !STOP_WORDS.has(stopWordKey(word)),
-  );
-  return [...new Set(words)];
+const ANALYZER_WORD = /[\p{L}\p{M}\p{N}_]+(?:(?:['’.]|(?<=\p{N}),(?=\p{N}))[\p{L}\p{M}\p{N}_]+)*/gu;
+
+/**
+ * The words of a lowercased query that each get a required group: the words `ANALYZER_WORD`
+ * extracts, holding a letter or digit, not an exempt stop word (see `STOP_WORDS`), first
+ * occurrence only. A group built from a whole joined token (`milk-chocolate`) would be split by
+ * the analyzer and its parts ORed, leaving each part optional, so every word gets its own group.
+ * A word with no letter or digit (`_`) analyzes to nothing in every field, and a fielded match on
+ * nothing matches no product (live: `milk -` with a group for `-` → 0, without it → 6), so it forms
+ * no group. Each word holds at least one of the letter-and-digit runs `countQueryWords` counts, so
+ * a query inside `MAX_QUERY_WORDS` never builds more groups than that.
+ *
+ * A query of fewer than two words gets none: the backend's relevance match already requires at
+ * least one of its terms (it sets `minimum_should_match: 1` beside filters, and a should-only query
+ * needs one anyway), so a lone word's group selects the same products (live: `milk` 6 with or
+ * without it) while costing about 200 ms a search.
+ */
+export function requiredWords(lowercasedQuery: string): string[] {
+  const words = lowercasedQuery.match(ANALYZER_WORD) ?? [];
+  if (words.length < 2) return [];
+  return [
+    ...new Set(
+      words.filter((word) => /[\p{L}\p{N}]/u.test(word) && !STOP_WORDS.has(stopWordKey(word))),
+    ),
+  ];
 }
 
 /** One word required across every searched field: `(field1:word OR field2:word OR …)`. */
@@ -515,6 +615,23 @@ function withBarcodes<T extends { code?: string }>(
     });
   }
   return kept;
+}
+
+/**
+ * The index's value for each constrained nutrient, keyed as `off_get_product` keys it. Only a JSON
+ * number is a value: a key the hit lacks, or holds as anything else, is left out rather than
+ * zero-filled — every value the live index returned was a number (2026-10-13).
+ */
+function pickIndexedNutriments(
+  nutriments: RawNutriments | undefined,
+  constrained: readonly NutrientField[],
+): IndexedNutriments {
+  const picked: IndexedNutriments = {};
+  for (const nutrient of constrained) {
+    const value = nutriments?.[`${nutrient}_100g`];
+    if (typeof value === 'number') picked[indexedNutrientKey(nutrient)] = value;
+  }
+  return picked;
 }
 
 /**
@@ -645,8 +762,10 @@ export class OpenFoodFactsService {
   /**
    * Fetch and normalize a single product. HTTP 404 — which OFF returns for barcodes no contributor
    * has entered, alongside the HTTP 200 + `status:0` form of the same condition — resolves to
-   * `null`; every other failure is re-raised as a declared contract failure. Returning `null` only
-   * for a genuine not-found is what lets callers distinguish "no record" from "the fetch failed".
+   * `null`; a 2xx body that is neither form nor `status: 1` with a product object is a malformed
+   * envelope, and it and every other failure are re-raised as declared contract failures.
+   * Returning `null` only for a genuine not-found is what lets callers distinguish "no record" from
+   * "the fetch failed". A found product with nothing entered for the requested fields is `{}`.
    */
   private async fetchProduct(
     url: string,
@@ -673,15 +792,19 @@ export class OpenFoodFactsService {
       throw toContractError(error, { barcode });
     }
 
-    const data = await parseJsonBody<RawProductResponse>(response, { barcode });
-    ctx.log.debug('Product response received', { barcode, status: data.status });
+    const data = await parseJsonBody<unknown>(response, { barcode });
+    ctx.log.debug('Product response received', {
+      barcode,
+      status: isRecord(data) ? data.status : undefined,
+    });
 
-    // status:0 = barcode not found in any contributor record (still HTTP 200)
-    if (data.status === 0) {
-      return null;
+    if (isProductEnvelope(data)) {
+      // status:0 = barcode not found in any contributor record, the HTTP 200 form of the 404.
+      return data.status === 0 ? null : data.product;
     }
-
-    return data.product ?? null;
+    throw malformedEnvelope('product lookup', 'status 1 with a product object, or status 0', {
+      barcode,
+    });
   }
 
   /**
@@ -753,6 +876,8 @@ export class OpenFoodFactsService {
    * languages a 12-word query was already a 23.6 KB URL the host refused with HTTP 414.
    */
   private async searchProductsByText(params: SearchParams, ctx: Context): Promise<SearchResult> {
+    // The nutrients a filter constrains, once each: a range pair names its nutrient twice.
+    const constrained = [...new Set((params.nutrient_filters ?? []).map((f) => f.nutrient))];
     return await withRetry(
       async () => {
         this.searchLimiter.check('search');
@@ -761,7 +886,10 @@ export class OpenFoodFactsService {
         const body = {
           q: this.buildTextSearchQuery(params),
           langs: TEXT_SEARCH_LANGS,
-          fields: SEARCH_FIELDS,
+          // A constrained search also asks for the index's nutrient map, so each row can show the
+          // values the constraint matched. The endpoint ignores a dotted `nutriments.<key>` field,
+          // so the whole map is requested and the constrained keys are picked below.
+          fields: constrained.length > 0 ? [...SEARCH_FIELDS, 'nutriments'] : SEARCH_FIELDS,
           page,
           page_size: pageSize,
           // search-a-licious sorts on a bare field name ascending and on a `-` prefix descending,
@@ -780,9 +908,11 @@ export class OpenFoodFactsService {
           body,
         );
 
-        const data = await parseJsonBody<RawTextSearchResponse>(response, { page });
+        const parsed = await parseJsonBody<unknown>(response, { page });
+        // Every field is still checked below; the cast only names the keys to read.
+        const data = (isRecord(parsed) ? parsed : {}) as RawTextSearchResponse;
 
-        if (data.errors?.length) {
+        if (Array.isArray(data.errors) && data.errors.length > 0) {
           const detail = plainTextDetail(
             data.errors.map((error) => error.description ?? error.title ?? '').join('; '),
           );
@@ -793,16 +923,24 @@ export class OpenFoodFactsService {
           );
         }
 
+        if (!isTextSearchEnvelope(data)) {
+          throw malformedEnvelope(
+            'text search',
+            'a hits list, a numeric count, and a boolean is_count_exact',
+            { page, page_size: pageSize },
+          );
+        }
+
         ctx.log.debug('Text search response received', {
           count: data.count,
           count_is_exact: data.is_count_exact,
           page: data.page,
-          returned: data.hits?.length ?? 0,
+          returned: data.hits.length,
         });
 
         // Normalize text search hits to the row shape (brands is array → join to string).
         // Use spread of defined-only fields to satisfy exactOptionalPropertyTypes.
-        const hits = data.hits ?? [];
+        const { hits } = data;
         const products: SearchRow[] = withBarcodes(hits, ctx).map((hit) => {
           const brands = Array.isArray(hit.brands) ? hit.brands.join(', ') : hit.brands;
           return {
@@ -813,16 +951,18 @@ export class OpenFoodFactsService {
             ...(hit.nova_group !== undefined && { nova_group: hit.nova_group }),
             ...(hit.ecoscore_grade !== undefined && { ecoscore_grade: hit.ecoscore_grade }),
             ...(hit.categories_tags !== undefined && { categories_tags: hit.categories_tags }),
+            ...(constrained.length > 0 && {
+              indexed_nutriments: pickIndexedNutriments(hit.nutriments, constrained),
+            }),
           };
         });
 
         return {
-          count: data.count ?? 0,
+          count: data.count,
           // The backend stops counting hits at a ceiling and reports which side of it this count
           // fell on. Read the flag rather than comparing the count against a local constant: the
-          // two are different limits, and only the backend knows when it stopped counting. A
-          // response that omits the flag makes no clipping claim, so none is manufactured here.
-          count_is_exact: data.is_count_exact ?? true,
+          // two are different limits, and only the backend knows when it stopped counting.
+          count_is_exact: data.is_count_exact,
           page: data.page ?? 1,
           // page_count in text search response is TOTAL PAGES; normalize to products-on-page
           page_count: products.length,
@@ -858,18 +998,24 @@ export class OpenFoodFactsService {
           page_size: params.page_size ?? 20,
         });
 
-        const data = await parseJsonBody<RawSearchResponse>(response, { page: params.page ?? 1 });
+        const data = await parseJsonBody<unknown>(response, { page: params.page ?? 1 });
+        if (!isTagSearchEnvelope(data)) {
+          throw malformedEnvelope('tag search', 'a products list and a numeric count', {
+            page: params.page ?? 1,
+            page_size: params.page_size ?? 20,
+          });
+        }
 
         ctx.log.debug('Tag search response received', {
           count: data.count,
           page: data.page,
-          returned: data.products?.length ?? 0,
+          returned: data.products.length,
         });
 
-        const rows = data.products ?? [];
+        const rows = data.products;
         const products = withBarcodes(rows, ctx);
         return {
-          count: data.count ?? 0,
+          count: data.count,
           // This endpoint counts every match — live-verified returning totals more than twenty
           // times the ceiling the text backend stops counting at — so its count is never a floor.
           count_is_exact: true,
@@ -916,17 +1062,23 @@ export class OpenFoodFactsService {
 
         ctx.log.debug('Resolving taxonomy term', { taxonomyName, term });
 
-        const data = await parseJsonBody<RawAutocompleteResponse>(
+        const data = await parseJsonBody<unknown>(
           await this.fetchSearch(url.toString(), ctx, 'OFF:suggestTaxonomy', {
             taxonomy_name: taxonomyName,
             term,
           }),
           { taxonomy_name: taxonomyName, term },
         );
+        if (!isAutocompleteEnvelope(data)) {
+          throw malformedEnvelope('taxonomy autocomplete', 'an options list', {
+            taxonomy_name: taxonomyName,
+            term,
+          });
+        }
 
         // An option missing either half is unusable as a filter value or a display name, so it is
         // dropped rather than passed on with an invented placeholder.
-        return (data.options ?? []).flatMap((option) =>
+        return data.options.flatMap((option) =>
           option.id && option.text ? [{ id: option.id, name: option.text }] : [],
         );
       },

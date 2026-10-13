@@ -66,7 +66,11 @@ export type RawProduct = {
   data_quality_tags?: string[];
 };
 
-/** Response envelope from GET /api/v2/product/{barcode}.json */
+/**
+ * Response envelope from GET /api/v2/product/{barcode}.json. A not-found barcode answers HTTP 404
+ * (or HTTP 200) with `status: 0`; a found one `status: 1` with a `product` object,
+ * which is `{}` when none of the requested fields is entered. Any other 2xx body is malformed.
+ */
 export type RawProductResponse = {
   code?: string;
   status: number;
@@ -83,11 +87,16 @@ export type RawSearchProduct = RawProduct & { code?: string };
 /**
  * A search result row the service hands on: its barcode matches `BARCODE_PATTERN`. Rows without
  * one are dropped before the page is counted — a row with nothing a product lookup can serve is not
- * a usable result.
+ * a usable result. `indexed_nutriments` is set on every row of a search carrying nutrient
+ * constraints, and on no other.
  */
-export type SearchRow = RawProduct & { code: string };
+export type SearchRow = RawProduct & { code: string; indexed_nutriments?: IndexedNutriments };
 
-/** Response envelope from GET /api/v2/search */
+/**
+ * Response envelope from GET /api/v2/search. Product Opener sets `count` only after its database
+ * query succeeds, so a failed query answers HTTP 200 with `products: []` and no count; the service
+ * accepts only an envelope carrying a `products` list and a numeric `count`.
+ */
 export type RawSearchResponse = {
   count?: number;
   page?: number;
@@ -112,8 +121,9 @@ export type RawTextSearchResponse = {
   count?: number;
   /**
    * False when `count` is the backend's hit-tracking ceiling rather than the real match total —
-   * search-a-licious stops counting at 10,000 and says so here. Required by its response schema;
-   * typed optional to match this file's convention that no upstream field is assumed present.
+   * search-a-licious stops counting at 10,000 and says so here. Required by its success schema, as
+   * are `hits` and `count`; typed optional because nothing upstream is assumed present, and the
+   * service refuses a success envelope missing any of the three as malformed.
    */
   is_count_exact?: boolean;
   page?: number;
@@ -133,6 +143,13 @@ export type RawTextSearchHit = {
   nova_group?: number;
   ecoscore_grade?: string;
   categories_tags?: string[];
+  /**
+   * The index's per-100 g / 100 ml nutrient map (`sugars_100g`, `energy-kcal_100g`, …), returned
+   * only when `nutriments` is among the requested `fields`. A dotted field such as
+   * `nutriments.sugars_100g` is silently ignored, so the whole map is the only form the endpoint
+   * returns.
+   */
+  nutriments?: RawNutriments;
 };
 
 /**
@@ -150,17 +167,18 @@ export type RawTaxonomyOption = {
 /**
  * Response envelope from GET https://search.openfoodfacts.org/autocomplete. The endpoint is a
  * suggester, not an enumerator: it reports no match total, accepts no offset or cursor, and answers
- * HTTP 200 with an empty `options` list for an empty query or an unknown taxonomy name.
+ * HTTP 200 with an empty `options` list for an empty query or an unknown taxonomy name. A body with
+ * no `options` list is malformed, not an empty answer.
  */
 export type RawAutocompleteResponse = {
   options?: RawTaxonomyOption[];
 };
 
 /**
- * Nutrients the text index carries as numeric per-100 g fields, under `nutriments.<name>_100g`.
- * Closed because the index answers a clause naming an unindexed field with HTTP 200 and zero hits
- * rather than an error: every name here was live-verified to return matches, and the per-serving
- * variants were verified not to, so only the per-100 g basis is offered.
+ * Nutrients the text index carries as numeric per-100 g / 100 ml fields, under
+ * `nutriments.<name>_100g`. Closed because the index answers a clause naming an unindexed field
+ * with HTTP 200 and zero hits rather than an error: every name here was live-verified to return
+ * matches, and the per-serving variants were verified not to, so only the per-100 basis is offered.
  */
 export const NUTRIENT_FIELDS = [
   'energy-kcal',
@@ -217,7 +235,29 @@ export type IngredientsAnalysisTag = (typeof INGREDIENTS_ANALYSIS_TAGS)[number];
 export type NutrientField = (typeof NUTRIENT_FIELDS)[number];
 export type NutrientOperator = (typeof NUTRIENT_OPERATORS)[number];
 
-/** One numeric constraint on a per-100 g nutrient value. */
+/** `S` with every hyphen as an underscore. */
+type Underscored<S extends string> = S extends `${infer Head}-${infer Tail}`
+  ? `${Head}_${Underscored<Tail>}`
+  : S;
+
+/**
+ * A nutrient's `_100g` key as `off_get_product` names it: hyphens as underscores, then `_100g`
+ * (`energy-kcal` → `energy_kcal_100g`).
+ */
+export type IndexedNutrientKey = `${Underscored<NutrientField>}_100g`;
+
+/** The `_100g` key `off_get_product` gives a nutrient the text index filters on. */
+export function indexedNutrientKey(nutrient: NutrientField): IndexedNutrientKey {
+  return `${nutrient.replace(/-/g, '_')}_100g` as IndexedNutrientKey;
+}
+
+/**
+ * The text index's values for a search's constrained nutrients, keyed by `IndexedNutrientKey`. A
+ * nutrient the index holds no numeric value for is absent, never zero.
+ */
+export type IndexedNutriments = Partial<Record<IndexedNutrientKey, number>>;
+
+/** One numeric constraint on a nutrient value per 100 g, or per 100 ml for liquids. */
 export type NutrientFilter = {
   nutrient: NutrientField;
   operator: NutrientOperator;
@@ -258,9 +298,10 @@ export type SearchParams = {
   nova_group?: string;
   countries_tag?: string;
   /**
-   * Numeric per-100 g nutrient constraints, ANDed with every other filter. Served only by the text
-   * backend — /api/v2/search documents the equivalent comparison parameters but ignores them, so a
-   * request carrying one routes to search.openfoodfacts.org whether or not it also carries `query`.
+   * Numeric per-100 g / 100 ml nutrient constraints, ANDed with every other filter. Served only by
+   * the text backend — /api/v2/search documents the equivalent comparison parameters but ignores
+   * them, so a request carrying one routes to search.openfoodfacts.org whether or not it also
+   * carries `query`.
    */
   nutrient_filters?: NutrientFilter[];
   /**

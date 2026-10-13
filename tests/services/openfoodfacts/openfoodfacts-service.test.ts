@@ -2,8 +2,8 @@
  * @fileoverview Regression tests for OpenFoodFactsService — covers HTTP 404 not-found handling
  * (Bug #3), text search routing (Bug #2), score-filter query-param mapping (GH issue #3), the
  * declared error contract carried by every failure (GH issue #12), retry classification and
- * upstream-detail surfacing (GH issue #19), status-decided retryability (GH issue #37), and
- * User-Agent header verification.
+ * upstream-detail surfacing (GH issue #19), status-decided retryability (GH issue #37), malformed
+ * success envelopes (GH issue #54), and User-Agent header verification.
  * @module tests/services/openfoodfacts/openfoodfacts-service.test
  */
 
@@ -21,6 +21,7 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
+import { offBrowseTaxonomyTool } from '@/mcp-server/tools/definitions/browse-taxonomy.tool.js';
 import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
 import { offGetProductTool } from '@/mcp-server/tools/definitions/get-product.tool.js';
 import { offSearchProductsTool } from '@/mcp-server/tools/definitions/search-products.tool.js';
@@ -31,12 +32,25 @@ import {
 import {
   initOpenFoodFactsService,
   OpenFoodFactsService,
+  requiredWords,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
+import { NUTRIENT_FIELDS } from '@/services/openfoodfacts/types.js';
 import { getTaxonomyService, initTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
 import {
   UPSTREAM_MULTI_MATCH_FIELDS,
   UPSTREAM_TEXT_LANGS,
 } from '../../fixtures/text-search-fields.js';
+import {
+  AUTOCOMPLETE_EMPTY,
+  AUTOCOMPLETE_HITS,
+  PRODUCT_FOUND,
+  PRODUCT_FOUND_EMPTY,
+  PRODUCT_NOT_FOUND_404,
+  TAG_SEARCH_EMPTY,
+  TAG_SEARCH_HITS,
+  TEXT_SEARCH_EMPTY,
+  TEXT_SEARCH_HITS,
+} from '../../fixtures/upstream-envelopes.js';
 
 /** The text search endpoint, which takes its parameters as a JSON body. */
 const TEXT_SEARCH_URL = 'https://search.openfoodfacts.org/search';
@@ -129,6 +143,25 @@ async function captureError(value: Promise<unknown>): Promise<McpErrorish> {
   throw new Error('Expected the service call to reject.');
 }
 
+/** Run a call to settlement with the retry backoff collapsed onto fake timers. */
+async function onFakeTimers<T>(run: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers();
+  try {
+    const pending = run();
+    // Attach a handler now so a rejection is not reported as unhandled while timers run.
+    pending.catch(() => undefined);
+    await vi.runAllTimersAsync();
+    return await pending;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** Run a service call that must reject to settlement on fake timers, returning its error. */
+function settle(run: () => Promise<unknown>): Promise<McpErrorish> {
+  return onFakeTimers(() => captureError(run()));
+}
+
 describe('OpenFoodFactsService', () => {
   let svc: OpenFoodFactsService;
   const globalFetch = global.fetch;
@@ -216,6 +249,7 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
           count: 3,
+          is_count_exact: true,
           page: 1,
           page_size: 20,
           page_count: 1,
@@ -262,6 +296,7 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
           count: 6070,
+          is_count_exact: true,
           page: 1,
           page_size: 20,
           page_count: 1,
@@ -295,11 +330,16 @@ describe('OpenFoodFactsService', () => {
       // search-a-licious uses different field names than /api/v2/search: nutriscore_grade (not
       // nutrition_grades_tags) and nova_group (no _tags suffix), both with bare values.
       const ctx = createMockContext();
-      global.fetch = vi
-        .fn()
-        .mockResolvedValue(
-          mockResponse({ count: 12, page: 1, page_size: 20, page_count: 1, hits: [] }),
-        );
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 12,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          is_count_exact: true,
+          hits: [],
+        }),
+      );
 
       await svc.searchProducts(
         { query: 'cereal', nutrition_grade: 'a', nova_group: '1', page: 1, page_size: 20 },
@@ -325,11 +365,16 @@ describe('OpenFoodFactsService', () => {
       // "a" even though nutriscore_grade isn't a facet this tool exposes. Escaping must neutralize
       // this without breaking ordinary free text (no reserved characters, e.g. "chocolate").
       const ctx = createMockContext();
-      global.fetch = vi
-        .fn()
-        .mockResolvedValue(
-          mockResponse({ count: 0, page: 1, page_size: 20, page_count: 1, hits: [] }),
-        );
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 0,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          is_count_exact: true,
+          hits: [],
+        }),
+      );
 
       await svc.searchProducts({ query: 'brands: nutella', page: 1, page_size: 20 }, ctx);
 
@@ -339,8 +384,12 @@ describe('OpenFoodFactsService', () => {
       const callerText = q.replace(/\([^()]*\)/g, '').trim();
       expect(callerText).toBe('brands\\: nutella');
       expect(callerText).not.toMatch(/(?<!\\):/);
-      // Inside a group the caller's colon is escaped too, so it stays part of the word.
-      expect(q).toContain('brands:brands\\:');
+      // The colon separates words, so it never reaches a group: each group holds a bare word.
+      const groupWords = [...q.matchAll(/\(([^()]*)\)/g)].map(
+        (group) =>
+          new Set(group[1]?.split(' OR ').map((clause) => clause.slice(clause.indexOf(':') + 1))),
+      );
+      expect(groupWords).toEqual([new Set(['brands']), new Set(['nutella'])]);
     });
 
     it('normalizes brands array from text search to a comma-joined string', async () => {
@@ -350,6 +399,7 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
           count: 1,
+          is_count_exact: true,
           page: 1,
           page_size: 20,
           page_count: 1,
@@ -395,6 +445,7 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
           count: 1,
+          is_count_exact: true,
           page: 1,
           page_size: 20,
           page_count: 1,
@@ -417,11 +468,16 @@ describe('OpenFoodFactsService', () => {
 
       for (const value of values) {
         const ctx = createMockContext();
-        global.fetch = vi
-          .fn()
-          .mockResolvedValue(
-            mockResponse({ count: 1, page: 1, page_size: 20, page_count: 1, hits: [] }),
-          );
+        global.fetch = vi.fn().mockResolvedValue(
+          mockResponse({
+            count: 1,
+            page: 1,
+            page_size: 20,
+            page_count: 1,
+            is_count_exact: true,
+            hits: [],
+          }),
+        );
 
         await svc.searchProducts(
           { query: 'chocolate', sort_by: value, page: 1, page_size: 20 },
@@ -434,11 +490,16 @@ describe('OpenFoodFactsService', () => {
 
     it('sends no sort parameter on either path when sort_by is omitted', async () => {
       const ctx = createMockContext();
-      global.fetch = vi
-        .fn()
-        .mockResolvedValue(
-          mockResponse({ count: 1, page: 1, page_size: 20, page_count: 1, hits: [] }),
-        );
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          page: 1,
+          page_size: 20,
+          page_count: 1,
+          is_count_exact: true,
+          hits: [],
+        }),
+      );
       await svc.searchProducts({ query: 'chocolate', page: 1, page_size: 20 }, ctx);
       expect(sentRequest().body).toBeDefined();
       expect(sentRequest().body).not.toHaveProperty('sort_by');
@@ -482,6 +543,7 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
           count: 1,
+          is_count_exact: true,
           page: 1,
           page_size: 20,
           page_count: 1,
@@ -505,6 +567,7 @@ describe('OpenFoodFactsService', () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockResponse({
           count: 40,
+          is_count_exact: true,
           page: 1,
           page_size: 2,
           page_count: 20, // 20 total pages in the text search response
@@ -1419,18 +1482,6 @@ describe('OpenFoodFactsService', () => {
     const refusalPage =
       '<!-- start templates/web/common/site_layout.tt.html -->\n\n<!doctype html>\n<html lang="en"><head><title>Error</title></head><body>Error</body></html>';
 
-    /** Run a service call to settlement with the retry backoff collapsed onto fake timers. */
-    async function settle(run: () => Promise<unknown>): Promise<McpErrorish> {
-      vi.useFakeTimers();
-      try {
-        const pending = captureError(run());
-        await vi.runAllTimersAsync();
-        return await pending;
-      } finally {
-        vi.useRealTimers();
-      }
-    }
-
     it('rejects a 501 once as upstream_rejected, not a retried upstream_error', async () => {
       // fetchWithTimeout flags a 501 data.retryable: false; the published-field allowlist used to
       // drop the flag and upstream_error set retryable: true again, so it was sent four times.
@@ -1548,6 +1599,33 @@ describe('OpenFoodFactsService', () => {
       expect(error.data?.retryable).toBe(true);
     });
 
+    it.each([
+      ['a plain-text 200', 'text/plain', 'Service degraded'],
+      ['a JSON 200 cut short', 'application/json', '{"status":1,"product":{"product_na'],
+    ])(
+      'reads %s as upstream_error, never a caller validation error',
+      async (_label, type, body) => {
+        const ctx = createMockContext({ errors: offGetProductTool.errors });
+        global.fetch = vi.fn(
+          async () =>
+            ({
+              ok: true,
+              status: 200,
+              headers: new Headers({ 'content-type': type }),
+              json: async () => JSON.parse(body),
+              text: async () => body,
+            }) as unknown as Response,
+        );
+
+        const error = await settle(() => svc.getProduct('3017620422003', ctx));
+
+        expect(global.fetch).toHaveBeenCalledTimes(4);
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data?.reason).toBe('upstream_error');
+        expect(error.data?.retryable).toBe(true);
+      },
+    );
+
     it('keeps a 504 an upstream_timeout, retried for the full budget', async () => {
       const ctx = createMockContext({ errors: offGetProductTool.errors });
       global.fetch = vi.fn().mockResolvedValue(mockResponse('Gateway Timeout', 504));
@@ -1586,6 +1664,271 @@ describe('OpenFoodFactsService', () => {
       expect(error.data?.reason).toBe('upstream_rejected');
       expect(error.data?.retryable).toBe(false);
       expect(error.data?.status).toBe(501);
+    });
+  });
+
+  // ── #54: a 2xx body missing its result fields is a failure, not an answer ──
+
+  describe('malformed success envelopes (#54)', () => {
+    /** Stub every request with the same JSON body; the request log says where each one went. */
+    function answerAll(body: unknown, status = 200): void {
+      global.fetch = vi.fn(async () => mockResponse(body, status));
+    }
+
+    /** The pathname of every request the stubbed fetch received, in order. */
+    function requestedPaths(): string[] {
+      return vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname);
+    }
+
+    /** Assert the declared retryable upstream failure, raised for a malformed body, after a full retry budget. */
+    function expectMalformedFailure(error: McpErrorish, path: string): void {
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data?.reason).toBe('upstream_error');
+      expect(error.data?.retryable).toBe(true);
+      expect(error.message).toContain('malformed');
+      // Raised inside the retry boundary, like an HTML page served with a 200: retried in full.
+      expect(requestedPaths()).toEqual([path, path, path, path]);
+    }
+
+    describe('genuine envelopes keep their meaning', () => {
+      it('returns a found product, and an empty product object as found with nothing entered', async () => {
+        const ctx = createMockContext();
+        answerAll(PRODUCT_FOUND);
+        await expect(svc.getProduct('3017620422003', ctx)).resolves.toMatchObject({
+          product_name: 'Nutella',
+          nutriscore_grade: 'e',
+        });
+
+        answerAll(PRODUCT_FOUND_EMPTY);
+        await expect(svc.getProductFields('3017620422003', 'zz', ctx)).resolves.toEqual({});
+        expect(requestedPaths()).toEqual(['/api/v2/product/3017620422003.json']);
+      });
+
+      it.each([
+        ['HTTP 404 with status 0', 404],
+        ['HTTP 200 with status 0', 200],
+      ])('returns null for %s, after one request', async (_label, status) => {
+        answerAll(PRODUCT_NOT_FOUND_404, status);
+
+        await expect(svc.getProduct('2961836540127', createMockContext())).resolves.toBeNull();
+        expect(global.fetch).toHaveBeenCalledOnce();
+      });
+
+      it('reads tag-search hits and a zero-hit page as counted answers', async () => {
+        const ctx = createMockContext();
+        answerAll(TAG_SEARCH_HITS);
+        const hits = await svc.searchProducts(
+          { categories_tag: 'en:hummus', page: 1, page_size: 2 },
+          ctx,
+        );
+        expect(hits).toMatchObject({ count: 4581, count_is_exact: true, page_count: 2 });
+        expect(hits.products.map((row) => row.code)).toEqual(['3292070005161', '3292070001576']);
+
+        answerAll(TAG_SEARCH_EMPTY);
+        const empty = await svc.searchProducts(
+          { categories_tag: 'en:zz', page: 1, page_size: 2 },
+          ctx,
+        );
+        expect(empty).toMatchObject({
+          count: 0,
+          count_is_exact: true,
+          page_count: 0,
+          products: [],
+        });
+      });
+
+      it('reads text-search hits and a zero-hit page as counted answers', async () => {
+        const ctx = createMockContext();
+        answerAll(TEXT_SEARCH_HITS);
+        const hits = await svc.searchProducts({ query: 'nutella', page: 1, page_size: 2 }, ctx);
+        expect(hits).toMatchObject({ count: 631, count_is_exact: true, page_count: 2 });
+
+        answerAll(TEXT_SEARCH_EMPTY);
+        const empty = await svc.searchProducts({ query: 'zzqxwvplmk', page: 1, page_size: 2 }, ctx);
+        expect(empty).toMatchObject({ count: 0, count_is_exact: true, products: [] });
+      });
+
+      it('reads autocomplete hits and an empty option list as answers', async () => {
+        const ctx = createMockContext();
+        answerAll(AUTOCOMPLETE_HITS);
+        await expect(svc.suggestTaxonomy('category', 'hummus', 3, ctx)).resolves.toEqual([
+          { id: 'en:hummus', name: 'Hummus' },
+        ]);
+
+        answerAll(AUTOCOMPLETE_EMPTY);
+        await expect(svc.suggestTaxonomy('category', 'zzqxwvplmk', 3, ctx)).resolves.toEqual([]);
+      });
+    });
+
+    it.each([
+      ['an empty object', {}],
+      ['status 1 with no product', { status: 1, status_verbose: 'product found' }],
+      ['a non-numeric status', { code: '1002', status: 'success', product: { product_name: 'x' } }],
+      ['status 1 with a null product', { status: 1, product: null }],
+      ['status 1 with an array for a product', { status: 1, product: [] }],
+      ['a JSON null', null],
+    ])('raises upstream_error for a product body that is %s', async (_label, body) => {
+      answerAll(body);
+
+      const error = await settle(() =>
+        svc.getProduct('1000', createMockContext({ errors: offGetProductTool.errors })),
+      );
+
+      expectMalformedFailure(error, '/api/v2/product/1000.json');
+    });
+
+    it.each([
+      // Product Opener's skeleton when its MongoDB query fails: `count` is set only on success.
+      ['no count', { page: 1, page_size: 24, skip: 0, products: [] }],
+      [
+        'a null count',
+        { count: null, page: 1, page_count: 0, page_size: 24, skip: 0, products: [] },
+      ],
+      ['no products', { count: 5, page: 1, page_size: 24, skip: 0 }],
+    ])('raises upstream_error for a tag-search body with %s', async (_label, body) => {
+      answerAll(body);
+
+      const error = await settle(() =>
+        svc.searchProducts(
+          { categories_tag: 'en:broken', page: 1, page_size: 24 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        ),
+      );
+
+      expectMalformedFailure(error, '/api/v2/search');
+    });
+
+    it.each([
+      ['no hits or count', { page: 1, page_size: 20 }],
+      ['hits but no count', { hits: [], page: 1, page_size: 20, page_count: 0 }],
+      ['no is_count_exact', { hits: [], count: 0, page: 1, page_size: 20 }],
+      ['a string is_count_exact', { hits: [], count: 0, is_count_exact: 'true', page: 1 }],
+    ])('raises upstream_error for a text-search body with %s', async (_label, body) => {
+      answerAll(body);
+
+      const error = await settle(() =>
+        svc.searchProducts(
+          { query: 'brokenhits', page: 1, page_size: 20 },
+          createMockContext({ errors: offSearchProductsTool.errors }),
+        ),
+      );
+
+      expectMalformedFailure(error, '/search');
+    });
+
+    it('raises upstream_error for an autocomplete body with no options', async () => {
+      answerAll({ took: 1, timed_out: false });
+
+      const error = await settle(() =>
+        svc.suggestTaxonomy('category', 'brokenac', 10, createMockContext()),
+      );
+
+      expectMalformedFailure(error, '/autocomplete');
+    });
+
+    it('reports a malformed tag-search page through the tool as upstream_error, never zero matches', async () => {
+      initOpenFoodFactsService();
+      answerAll({ page: 1, page_size: 24, skip: 0, products: [] });
+
+      const result = await onFakeTimers(() =>
+        runToolContract(offSearchProductsTool, { categories_tag: 'en:broken' }),
+      );
+
+      expect(result.isError).toBe(true);
+      const error = (result.structuredContent as { error: McpErrorish }).error;
+      expect(error.data?.reason).toBe('upstream_error');
+      expect(error.data?.retryable).toBe(true);
+      expect(JSON.stringify(result.content)).not.toContain('No products found');
+    });
+
+    it('reports a malformed product body through off_get_product as upstream_error, not not_found', async () => {
+      initOpenFoodFactsService();
+      answerAll({});
+
+      const result = await onFakeTimers(() =>
+        runToolContract(offGetProductTool, { barcode: '1000' }),
+      );
+
+      expect(result.isError).toBe(true);
+      const error = (result.structuredContent as { error: McpErrorish }).error;
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data?.reason).toBe('upstream_error');
+    });
+
+    describe('malformed autocomplete', () => {
+      beforeEach(() => {
+        initOpenFoodFactsService();
+        initTaxonomyService();
+        answerAll({ took: 1, timed_out: false });
+      });
+
+      it('makes canonicalizeTag return lookup_failed and keeps it out of the cache', async () => {
+        const taxonomy = getTaxonomyService();
+        const ctx = createMockContext();
+
+        const first = await onFakeTimers(() =>
+          taxonomy.canonicalizeTag('allergens', 'en:brokenac', ctx),
+        );
+        expect(first).toEqual({
+          value: 'en:brokenac',
+          resolution: 'normalized',
+          reason: 'lookup_failed',
+        });
+        const afterFirst = requestedPaths().length;
+
+        const second = await onFakeTimers(() =>
+          taxonomy.canonicalizeTag('allergens', 'en:brokenac', ctx),
+        );
+        expect(second).toEqual(first);
+        // Not cached: the second call asks the vocabulary again.
+        expect(requestedPaths().length).toBeGreaterThan(afterFirst);
+        expect(new Set(requestedPaths())).toEqual(new Set(['/autocomplete']));
+      });
+
+      it('falls back to the offline sample with a notice that the vocabulary gave no usable answer', async () => {
+        const result = await onFakeTimers(() =>
+          runToolContract(offBrowseTaxonomyTool, { facet: 'categories', search: 'brokenac' }),
+        );
+
+        expect(result.isError).toBeFalsy();
+        const output = result.structuredContent as { tags: unknown[]; notice?: string };
+        expect(output.tags).toEqual([]);
+        expect(output.notice).toContain('could not be reached or gave no usable answer');
+        expect(output.notice).toContain('malformed');
+        expect(output.notice).not.toContain('No categories tag matched');
+      });
+
+      it('refuses an exclusion it could not check as retryable, and checks again on the next call', async () => {
+        const call = () =>
+          onFakeTimers(() =>
+            runToolContract(offSearchProductsTool, {
+              categories_tag: 'en:hummus',
+              exclude_allergens: ['en:brokenac'],
+            }),
+          );
+
+        for (const attempt of [1, 2]) {
+          const result = await call();
+          expect(result.isError).toBe(true);
+          const error = (result.structuredContent as { error: McpErrorish }).error;
+          expect(error.data?.reason).toBe('unrecognized_exclusion');
+          expect(error.data?.retryable).toBe(true);
+          // An unusable answer is named alongside an unreachable vocabulary, on every surface.
+          expect(error.message).toContain('could not be reached or gave no usable answer');
+          expect(error.data?.recovery?.hint).toContain(
+            'could not be reached or gave no usable answer',
+          );
+          // Each call re-queries the vocabulary: four attempts each, nothing sent to search.
+          expect(requestedPaths()).toEqual(Array(4 * attempt).fill('/autocomplete'));
+        }
+      });
+
+      it('names an unusable answer in the declared unrecognized_exclusion condition', () => {
+        const entry = offSearchProductsTool.errors?.find(
+          ({ reason }) => reason === 'unrecognized_exclusion',
+        );
+        expect(entry?.when).toContain('could not be reached or gave no usable answer');
+      });
     });
   });
 
@@ -1726,7 +2069,8 @@ describe('OpenFoodFactsService', () => {
       expect(sentRequest().body).toEqual({
         q: 'nutriments.sugars_100g:[* TO 5]',
         langs: [...UPSTREAM_TEXT_LANGS],
-        fields: SEARCH_FIELD_LIST,
+        // A nutrient constraint also asks for the index's nutrient map (#58).
+        fields: [...SEARCH_FIELD_LIST, 'nutriments'],
         page: 1,
         page_size: 20,
       });
@@ -1874,8 +2218,117 @@ describe('OpenFoodFactsService', () => {
       // Live: `milk` in Mongolia matches the same 6 products with or without its group, and the
       // group costs about 200 ms a search.
       await expect(qFor({ query: 'Milk' })).resolves.toBe('milk');
+      // One word under the analyzer's grammar, however it is punctuated.
+      await expect(qFor({ query: "L'eau", labels_tag: 'en:organic' })).resolves.toBe(
+        'labels_tags:"en:organic" l\'eau',
+      );
+      await expect(qFor({ query: 'milk!' })).resolves.toBe('milk\\!');
+    });
+
+    it('groups each part of a hyphen-joined query, which is two words to the analyzer', async () => {
+      // Live, Mongolia: `milk-chocolate` counted 9 (milk OR chocolate) with no group, and 1 — the
+      // intersection — with a group per part, the same as `milk chocolate`.
       await expect(qFor({ query: 'dark-chocolate', labels_tag: 'en:organic' })).resolves.toBe(
-        'labels_tags:"en:organic" dark\\-chocolate',
+        `labels_tags:"en:organic" ${wordGroup('dark')} ${wordGroup('chocolate')} dark\\-chocolate`,
+      );
+    });
+
+    it.each([
+      ['-', '\\-'],
+      ['/', '\\/'],
+      ['+', '\\+'],
+      ['&', '\\&'],
+      [',', ','],
+      [':', '\\:'],
+    ])('requires both words joined by %s, which separates words', async (separator, escaped) => {
+      // Live, Mongolia: a single group for `milk<sep>xyzzyqq` matched the 6 `milk` products, so
+      // the analyzer split it; one group per part matches nothing, as `milk xyzzyqq` does.
+      await expect(qFor({ query: `milk${separator}xyzzyqq` })).resolves.toBe(
+        `${wordGroup('milk')} ${wordGroup('xyzzyqq')} milk${escaped}xyzzyqq`,
+      );
+    });
+
+    it.each(["'", '’', '.', '_'])(
+      'keeps a word joined by %s whole, which the analyzer keeps as one token',
+      async (joiner) => {
+        // Live, Mongolia: a group for `milk<joiner>xyzzyqq` matched 0 — one token, not two.
+        const word = `milk${joiner}xyzzyqq`;
+
+        await expect(qFor({ query: word })).resolves.toBe(word);
+        await expect(qFor({ query: `${word} cocoa` })).resolves.toBe(
+          `${wordGroup(word)} ${wordGroup('cocoa')} ${word} cocoa`,
+        );
+      },
+    );
+
+    it('joins across only a single apostrophe or period between word characters', async () => {
+      // A doubled joiner, or one at a word's edge, separates.
+      await expect(qFor({ query: "milk..cocoa 'oat' rice' u.s." })).resolves.toBe(
+        `${wordGroup('milk')} ${wordGroup('cocoa')} ${wordGroup('oat')} ${wordGroup('rice')} ${wordGroup('u.s')} milk..cocoa 'oat' rice' u.s.`,
+      );
+    });
+
+    it('keeps a decimal comma inside its number, and separates at a comma elsewhere', async () => {
+      // Live: `lait 1,5%` with groups for `1` and `5` matched 27 products, only names spelling it
+      // `1, 5%`; one `1,5` group matched 324, the products named `Lait 1,5%`.
+      await expect(qFor({ query: 'lait 1,5%' })).resolves.toBe(
+        `${wordGroup('lait')} ${wordGroup('1,5')} lait 1,5%`,
+      );
+      await expect(qFor({ query: 'milk,cocoa 1,cocoa' })).resolves.toBe(
+        `${wordGroup('milk')} ${wordGroup('cocoa')} ${wordGroup('1')} milk,cocoa 1,cocoa`,
+      );
+    });
+
+    it('keeps accents and combining marks inside a word', async () => {
+      const decomposed = 'café';
+      await expect(qFor({ query: `crème-brûlée ${decomposed}` })).resolves.toBe(
+        `${wordGroup('crème')} ${wordGroup('brûlée')} ${wordGroup(decomposed)} crème\\-brûlée ${decomposed}`,
+      );
+    });
+
+    it.each([
+      ['a long run of word characters', (n: number) => 'a'.repeat(n)],
+      ['joiners between single characters', (n: number) => 'a.'.repeat(n / 2)],
+      ['doubled joiners', (n: number) => "a''".repeat(n / 3)],
+      ['decimal commas between single digits', (n: number) => '1,'.repeat(n / 2)],
+      ['separators only', (n: number) => '-/+&,:'.repeat(n / 6)],
+      ['combining marks only', (n: number) => '́'.repeat(n)],
+      [
+        'many short distinct words',
+        (n: number) => Array.from({ length: n / 6 }, (_, i) => `w${i}`).join(' '),
+      ],
+    ])('extracts words in linear time from %s', (_label, make) => {
+      // The query reaches the word scan with no length bound — only its word count is capped.
+      /** Fastest of several samples, each repeated until it has used about 20 ms of CPU. */
+      const cpuMsPerRun = (input: string): number => {
+        let fastest = Number.POSITIVE_INFINITY;
+        for (let sample = 0; sample < 5; sample++) {
+          const start = process.threadCpuUsage();
+          let runs = 0;
+          let usedMs = 0;
+          do {
+            requiredWords(input);
+            runs++;
+            const used = process.threadCpuUsage(start);
+            usedMs = (used.user + used.system) / 1000;
+          } while (usedMs < 20);
+          fastest = Math.min(fastest, usedMs / runs);
+        }
+        return fastest;
+      };
+
+      const small = cpuMsPerRun(make(5_000));
+      const large = cpuMsPerRun(make(320_000));
+
+      // 64× the input: linear stays near 64×, quadratic would reach 4,096×.
+      expect(large / small).toBeLessThan(256);
+      expect(large).toBeLessThan(250);
+    });
+
+    it('dedupes a word repeated inside a joined token, and still requires the new one', async () => {
+      // Live, Mongolia: `milk milk-xyzzyqq` counted 6 with whitespace groups, 0 with these.
+      await expect(qFor({ query: 'milk milk-xyzzyqq' })).resolves.toBe(
+        `${wordGroup('milk')} ${wordGroup('xyzzyqq')} milk milk\\-xyzzyqq`,
       );
     });
 
@@ -1921,7 +2374,7 @@ describe('OpenFoodFactsService', () => {
       const q = await qFor({ query: 'chocolate with hazelnuts, and the' });
 
       expect(q).toBe(
-        `${wordGroup('chocolate')} ${wordGroup('hazelnuts,')} chocolate with hazelnuts, and the`,
+        `${wordGroup('chocolate')} ${wordGroup('hazelnuts')} chocolate with hazelnuts, and the`,
       );
     });
 
@@ -1990,14 +2443,15 @@ describe('OpenFoodFactsService', () => {
     it('keeps a field:value-shaped query as words rather than a field clause', async () => {
       const q = await qFor({ query: 'brands: nutella' });
 
-      expect(q).toBe(`${wordGroup('brands\\:')} ${wordGroup('nutella')} brands\\: nutella`);
+      // The colon separates words, so the field name is an ordinary word with its own group.
+      expect(q).toBe(`${wordGroup('brands')} ${wordGroup('nutella')} brands\\: nutella`);
     });
 
-    it('escapes reserved characters inside a group and groups a repeated word once', async () => {
+    it('groups the words of joined tokens once each, leaving the escaped bare query for ranking', async () => {
       const q = await qFor({ query: 'dark-chocolate 70% dark-chocolate' });
 
       expect(q).toBe(
-        `${wordGroup('dark\\-chocolate')} ${wordGroup('70%')} dark\\-chocolate 70% dark\\-chocolate`,
+        `${wordGroup('dark')} ${wordGroup('chocolate')} ${wordGroup('70')} dark\\-chocolate 70% dark\\-chocolate`,
       );
     });
 
@@ -2627,6 +3081,356 @@ describe('OpenFoodFactsService', () => {
 
         expect(result.last_page).toBe(10);
       });
+    });
+  });
+
+  // ── #58: rows of a nutrient-filtered search carry the values the filter matched ──
+
+  describe('indexed nutrient values (#58)', () => {
+    beforeEach(() => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+    });
+
+    /** The index's per-100 g map as the live text index returns it for one hit (2026-10-13). */
+    const INDEXED_MAP = {
+      carbohydrates_100g: 46.15,
+      'energy-kcal_100g': 538,
+      'energy-kj_100g': 2251,
+      fat_100g: 34.62,
+      fiber_100g: 11.5,
+      proteins_100g: 7.69,
+      salt_100g: 0.04,
+      'saturated-fat_100g': 21.15,
+      sodium_100g: 0.016,
+      sugars_100g: 3.85,
+    };
+
+    /** Every text block of a contract result — format() output plus the enrichment trailer. */
+    function allText(result: { content?: { type: string; text?: string }[] }): string {
+      return (result.content ?? []).map((block) => block.text ?? '').join('\n');
+    }
+
+    it('leaves a search without nutrient filters exactly as it was, even when hits carry nutriments', async () => {
+      // Characterization: the request body and the rows a query-only search produced before #58.
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          textHits([{ code: '7771711000483', product_name: 'Dark', nutriments: INDEXED_MAP }], 1),
+        );
+
+      const result = await runToolContract(offSearchProductsTool, { query: 'dark chocolate' });
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(JSON.stringify(sentRequest().body)).toBe(
+        JSON.stringify({
+          q: `${wordGroup('dark')} ${wordGroup('chocolate')} dark chocolate`,
+          langs: [...UPSTREAM_TEXT_LANGS],
+          fields: SEARCH_FIELD_LIST,
+          page: 1,
+          page_size: 20,
+        }),
+      );
+      const structured = result.structuredContent as {
+        products: Record<string, unknown>[];
+        text_index_snapshot?: string;
+      };
+      expect(structured.products).toEqual([{ barcode: '7771711000483', product_name: 'Dark' }]);
+      expect(allText(result)).not.toMatch(/indexed/i);
+      expect(String(structured.text_index_snapshot)).not.toMatch(/indexed_nutriments/);
+    });
+
+    it('never adds the field on a tag-only search', async () => {
+      // Characterization: the tag path requests and returns the summary fields alone.
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 1,
+          page: 1,
+          page_count: 1,
+          page_size: 20,
+          products: [{ code: '7771711000483', nutriments: INDEXED_MAP }],
+        }),
+      );
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:dark-chocolates',
+      });
+
+      expect(sentRequest().url).toContain(
+        'fields=code%2Cproduct_name%2Cbrands%2Cnutriscore_grade%2Cnova_group%2Cecoscore_grade%2Ccategories_tags&',
+      );
+      expect((result.structuredContent as { products: unknown[] }).products).toEqual([
+        { barcode: '7771711000483' },
+      ]);
+    });
+
+    it('asks for the whole nutriments map on a nutrient-filtered search, in its one request', async () => {
+      global.fetch = vi.fn().mockResolvedValue(textHits([]));
+
+      await runToolContract(offSearchProductsTool, {
+        query: 'dark chocolate',
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+      });
+
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(sentRequest().body?.fields).toEqual([...SEARCH_FIELD_LIST, 'nutriments']);
+    });
+
+    it('carries exactly the constrained keys each hit holds, omitting the rest, on both surfaces', async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        textHits(
+          [
+            // Every indexed key: only the constrained one reaches the row.
+            { code: '7771711000483', product_name: 'Dark 70', nutriments: INDEXED_MAP },
+            // The constrained key absent: omitted, never zero-filled.
+            { code: '8901262070676', nutriments: { fat_100g: 30 } },
+            // No map at all.
+            { code: '3017620422003' },
+            // A value that is not a number is not a measurement.
+            { code: '5413121361342', nutriments: { sugars_100g: '1' } },
+            // A real zero stays a zero.
+            { code: '8003288339765', nutriments: { sugars_100g: 0 } },
+          ],
+          1813,
+        ),
+      );
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'dark chocolate',
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 8 }],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const rows = (
+        result.structuredContent as {
+          products: { barcode: string; indexed_nutriments?: Record<string, number> }[];
+        }
+      ).products;
+      expect(rows.map(({ barcode, indexed_nutriments }) => [barcode, indexed_nutriments])).toEqual([
+        ['7771711000483', { sugars_100g: 3.85 }],
+        ['8901262070676', {}],
+        ['3017620422003', {}],
+        ['5413121361342', {}],
+        ['8003288339765', { sugars_100g: 0 }],
+      ]);
+
+      const text = allText(result);
+      expect(text).toContain(
+        '**Indexed per 100 g, or per 100 ml for liquids:** sugars_100g 3.85 g',
+      );
+      expect(text).toContain('**Indexed per 100 g, or per 100 ml for liquids:** sugars_100g 0 g');
+      // A row without the value says so rather than showing a number.
+      expect(text).toContain('**Indexed per 100 g, or per 100 ml for liquids:** none returned');
+    });
+
+    it('keys every filterable nutrient as off_get_product does, deduplicating a range pair', async () => {
+      // The same raw map through both tools: each search key must name the value off_get_product
+      // reports under that key.
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(
+          mockResponse({ code: '7771711000483', status: 1, product: { nutriments: INDEXED_MAP } }),
+        );
+      const product = await runToolContract(offGetProductTool, { barcode: '7771711000483' });
+      const productNutriments = (
+        product.structuredContent as { product: { nutriments: Record<string, unknown> } }
+      ).product.nutriments;
+
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(textHits([{ code: '7771711000483', nutriments: INDEXED_MAP }], 1));
+      const search = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: [
+          ...NUTRIENT_FIELDS.map((nutrient) => ({ nutrient, operator: 'gte' as const, value: 0 })),
+          { nutrient: 'sugars', operator: 'lte', value: 8 },
+        ],
+      });
+      const indexed = (
+        search.structuredContent as { products: { indexed_nutriments: Record<string, number> }[] }
+      ).products[0]?.indexed_nutriments;
+
+      expect(Object.keys(indexed ?? {})).toHaveLength(NUTRIENT_FIELDS.length);
+      for (const [key, value] of Object.entries(indexed ?? {})) {
+        expect(productNutriments[key]).toBe(value);
+      }
+      // energy-kj is indexed but filterable by nothing, so no row carries it.
+      expect(JSON.stringify(indexed)).not.toContain('kj');
+    });
+
+    it('carries only the constrained nutrients, not every indexed one', async () => {
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(textHits([{ code: '7771711000483', nutriments: INDEXED_MAP }], 1));
+
+      // A category the offline sample confirms, so the only request is the search.
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:chocolates',
+        nutrient_filters: [
+          { nutrient: 'energy-kcal', operator: 'lte', value: 600 },
+          { nutrient: 'saturated-fat', operator: 'gt', value: 2 },
+        ],
+      });
+
+      expect(
+        (result.structuredContent as { products: { indexed_nutriments: unknown }[] }).products[0]
+          ?.indexed_nutriments,
+      ).toEqual({ energy_kcal_100g: 538, saturated_fat_100g: 21.15 });
+      expect(allText(result)).toContain('energy_kcal_100g 538 kcal, saturated_fat_100g 21.15 g');
+    });
+
+    it('echoes the constraints in the snapshot note on both surfaces, never in notice', async () => {
+      global.fetch = vi
+        .fn()
+        .mockResolvedValue(textHits([{ code: '7771711000483', nutriments: INDEXED_MAP }], 1));
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'dark chocolate',
+        nutrient_filters: [
+          { nutrient: 'sugars', operator: 'lt', value: 8 },
+          { nutrient: 'proteins', operator: 'gte', value: 5 },
+        ],
+      });
+
+      const structured = result.structuredContent as {
+        text_index_snapshot?: string;
+        notice?: string;
+      };
+      const sentence =
+        'The nutrient constraints (sugars < 8, proteins >= 5) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.';
+      expect(structured.text_index_snapshot).toContain(sentence);
+      expect(allText(result)).toContain(sentence);
+      expect(structured.notice ?? '').not.toContain('indexed_nutriments');
+    });
+
+    it('answers a zero-hit page with the echo and no rows', async () => {
+      global.fetch = vi.fn().mockResolvedValue(textHits([], 0));
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'dark chocolate',
+        nutrient_filters: [{ nutrient: 'sugars', operator: 'lt', value: 0.01 }],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as {
+        total: number;
+        products: unknown[];
+        text_index_snapshot?: string;
+        notice?: string;
+      };
+      expect(structured.total).toBe(0);
+      expect(structured.products).toEqual([]);
+      expect(structured.text_index_snapshot).toContain('(sugars < 0.01)');
+      expect(structured.notice).toContain('nutrient="sugars<0.01"');
+      expect(allText(result)).not.toContain('**Indexed');
+    });
+
+    it('answers a page past the end with no rows and the echo kept', async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockResponse({
+          count: 30,
+          is_count_exact: true,
+          page: 3,
+          page_size: 20,
+          page_count: 2,
+          hits: [],
+        }),
+      );
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: [{ nutrient: 'salt', operator: 'lt', value: 1 }],
+        page: 3,
+      });
+
+      const structured = result.structuredContent as {
+        products: unknown[];
+        notice?: string;
+        text_index_snapshot?: string;
+      };
+      expect(structured.products).toEqual([]);
+      expect(structured.notice).toMatch(/past the end/);
+      expect(structured.text_index_snapshot).toContain('(salt < 1)');
+    });
+
+    it('carries the field on every row of a full 50-row page', async () => {
+      const hits = Array.from({ length: 50 }, (_, i) => ({
+        code: String(3_017_620_422_003 + i),
+        nutriments: i % 2 === 0 ? { fiber_100g: i } : {},
+      }));
+      global.fetch = vi.fn().mockResolvedValue(textHits(hits, 1813));
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: [{ nutrient: 'fiber', operator: 'gte', value: 0 }],
+        page_size: 50,
+      });
+
+      const { products: rows, truncated } = result.structuredContent as {
+        products: { indexed_nutriments?: Record<string, number> }[];
+        truncated?: boolean;
+      };
+      expect(rows).toHaveLength(50);
+      expect(rows.every((row) => row.indexed_nutriments !== undefined)).toBe(true);
+      expect(rows[2]?.indexed_nutriments).toEqual({ fiber_100g: 2 });
+      expect(rows[1]?.indexed_nutriments).toEqual({});
+      expect(truncated).toBe(true);
+    });
+
+    it('rejects an unknown nutrient before any request', async () => {
+      global.fetch = vi.fn();
+
+      const result = await runToolContract(offSearchProductsTool, {
+        nutrient_filters: [{ nutrient: 'energy-kj', operator: 'lt', value: 1 }],
+      } as never);
+
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: McpErrorish }).error.code).toBe(
+        JsonRpcErrorCode.InvalidParams,
+      );
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── #60: a cancellation during tag resolution ends the search ─────────────
+
+  describe('caller cancellation during tag resolution (#60)', () => {
+    beforeEach(() => {
+      initOpenFoodFactsService();
+      initTaxonomyService();
+    });
+
+    it('ends off_search_products as cancelled and sends no search', async () => {
+      let entered: () => void = () => undefined;
+      const fetchEntered = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+        entered();
+        return new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(new DOMException('The operation was aborted.', 'AbortError'));
+          if (init?.signal?.aborted) abort();
+          init?.signal?.addEventListener('abort', abort);
+        });
+      }) as typeof fetch;
+      const controller = new AbortController();
+
+      // The search request would itself end cancelled, so the error code alone cannot tell the
+      // fix apart from a cancellation absorbed as lookup_failed; the request log can.
+      const pending = runToolContract(
+        offSearchProductsTool,
+        { query: 'soup', categories_tag: 'lentil soups' },
+        { context: { signal: controller.signal, errors: offSearchProductsTool.errors } },
+      );
+      await fetchEntered;
+      controller.abort();
+      const result = await pending;
+
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: McpErrorish }).error.code).toBe(
+        JsonRpcErrorCode.RequestCancelled,
+      );
+      // Only the autocomplete was ever sent: no unconfirmed value went on to the search.
+      expect(
+        vi.mocked(global.fetch).mock.calls.map(([input]) => new URL(String(input)).pathname),
+      ).toEqual(['/autocomplete']);
     });
   });
 });

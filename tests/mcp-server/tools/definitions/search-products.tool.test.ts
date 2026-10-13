@@ -224,6 +224,7 @@ describe('off_search_products', () => {
       total: 10,
       total_is_lower_bound: false,
       page: 1,
+      page_size: 20,
       page_count: 1,
       products: [
         {
@@ -245,7 +246,14 @@ describe('off_search_products', () => {
   });
 
   it('formats empty results with guidance', () => {
-    const output = { total: 0, total_is_lower_bound: false, page: 1, page_count: 0, products: [] };
+    const output = {
+      total: 0,
+      total_is_lower_bound: false,
+      page: 1,
+      page_size: 20,
+      page_count: 0,
+      products: [],
+    };
     const blocks = offSearchProductsTool.format!(output);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
     const text = firstText(blocks);
@@ -388,7 +396,10 @@ describe('off_search_products', () => {
 
     await offSearchProductsTool.handler({ query: 'chocolate', page: 5000, page_size: 2 }, ctx);
 
-    const guidance = String(getEnrichment(ctx).notice ?? '');
+    const enrichment = getEnrichment(ctx);
+    // Matches lie beyond the window, so the page is still truncated.
+    expect(enrichment.truncated).toBe(true);
+    const guidance = String(enrichment.notice ?? '');
     expect(guidance).toContain('as deep as text search paginates');
     expect(guidance).not.toContain('fetch subsequent pages');
   });
@@ -405,57 +416,11 @@ describe('off_search_products', () => {
 
     await offSearchProductsTool.handler({ query: 'chocolate', page: 500, page_size: 20 }, ctx);
 
-    expect(String(getEnrichment(ctx).notice ?? '')).toContain('as deep as text search paginates');
-  });
-
-  it('says no further pages exist when a text result set ends inside the window', async () => {
-    mockSearch({
-      count: 12,
-      page: 3,
-      page_count: 2,
-      page_size: 5,
-      products: [{ code: '1234567890001' }],
-    });
-
-    await offSearchProductsTool.handler({ query: 'kombucha', page: 3, page_size: 5 }, ctx);
-
-    const guidance = String(getEnrichment(ctx).notice ?? '');
-    expect(guidance).toBe('Page 3 of 3. No further pages of matches exist.');
-  });
-
-  it('says no further pages exist when the text window ends exactly at the last match', async () => {
-    mockSearch({
-      count: TEXT_SEARCH_RESULT_WINDOW,
-      page: 5000,
-      page_count: 2,
-      page_size: 2,
-      products: [{ code: '1234567890001' }],
-    });
-
-    await offSearchProductsTool.handler({ query: 'chocolate', page: 5000, page_size: 2 }, ctx);
-
-    const guidance = String(getEnrichment(ctx).notice ?? '');
-    expect(guidance).toContain('No further pages of matches exist.');
-    expect(guidance).not.toMatch(/as deep as/);
-  });
-
-  it('says no further pages exist on the last page of a tag search', async () => {
-    mockSearch({
-      count: 25,
-      page: 5,
-      page_count: 5,
-      page_size: 5,
-      products: [{ code: '1234567890001' }],
-    });
-
-    await offSearchProductsTool.handler(
-      { categories_tag: 'en:pizzas', page: 5, page_size: 5 },
-      ctx,
-    );
-
-    const guidance = String(getEnrichment(ctx).notice ?? '');
-    expect(guidance).toContain('No further pages of matches exist.');
-    expect(guidance).not.toContain('fetch subsequent pages');
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    const guidance = String(enrichment.notice ?? '');
+    expect(guidance).toContain('as deep as text search paginates');
+    expect(guidance).toContain('the backend stopped counting');
   });
 
   // ── sparse upstream products in search results ─────────────────────────────
@@ -501,6 +466,7 @@ describe('off_search_products', () => {
       total: 1,
       total_is_lower_bound: false,
       page: 1,
+      page_size: 20,
       page_count: 1,
       products: [
         {
@@ -770,6 +736,42 @@ describe('off_search_products', () => {
       expect(description).toMatch(/100\s?g/i);
       expect(description).toMatch(/text/i);
     });
+
+    /** The advertised field schemas of one nutrient_filters entry. */
+    function nutrientFilterEntry(): Record<string, { description?: string }> {
+      return (
+        offSearchProductsTool.input.shape.nutrient_filters.unwrap().element as unknown as {
+          shape: Record<string, { description?: string }>;
+        }
+      ).shape;
+    }
+
+    it('keeps kcal for energy and grams for every other nutrient in the filter descriptions', () => {
+      const entry = nutrientFilterEntry();
+
+      // The threshold names its unit rather than pointing at the nutrient's.
+      for (const field of ['nutrient', 'value']) {
+        expect(entry[field]?.description, field).toMatch(/kilocalories/);
+        expect(entry[field]?.description, field).toMatch(/grams/);
+      }
+    });
+
+    it('states the basis as per 100 g, or per 100 ml for liquids (#51)', () => {
+      const basis = 'per 100 g, or per 100 ml for liquids';
+      const entry = nutrientFilterEntry();
+      const descriptions = [
+        offSearchProductsTool.description,
+        inputDescription('nutrient_filters'),
+        entry.nutrient?.description ?? '',
+        entry.value?.description ?? '',
+      ];
+
+      for (const text of descriptions) {
+        expect(text).toContain(basis);
+        // Any spelling of the unit — "100g", "100 g", "100-g", "100 grams" — needs the ml clause.
+        expect(text).not.toMatch(/(?<![_\d])100[ -]?g(?:rams?)?\b(?!, or per 100 ml for liquids)/i);
+      }
+    });
   });
 
   // ── exhausted pages vs zero matches (GH issue #24) ────────────────────────
@@ -791,23 +793,24 @@ describe('off_search_products', () => {
       expect(notice).toContain('Try broader terms');
     });
 
-    it('leaves a partially filled last page unchanged', async () => {
+    it('treats a partially filled last page as final, neither exhausted nor truncated', async () => {
       mockSearch({
-        count: 25,
+        count: 23,
         page: 5,
         page_count: 3,
         page_size: 5,
         products: [{ code: '1234567890001' }],
       });
 
-      await offSearchProductsTool.handler(
+      const result = await offSearchProductsTool.handler(
         { categories_tag: 'en:pizzas', page: 5, page_size: 5 },
         ctx,
       );
 
-      const notice = String(getEnrichment(ctx).notice ?? '');
-      expect(notice).toContain('No further pages of matches exist.');
-      expect(notice).not.toMatch(/past the end/i);
+      expect(result.last_page).toBe(5);
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.notice).toBeUndefined();
+      expect(enrichment.truncated).toBeUndefined();
     });
 
     it('renders the zero-match formatter text unchanged', () => {
@@ -816,6 +819,7 @@ describe('off_search_products', () => {
           total: 0,
           total_is_lower_bound: false,
           page: 1,
+          page_size: 20,
           page_count: 0,
           products: [],
         }),
@@ -932,6 +936,7 @@ describe('off_search_products', () => {
           total: 3,
           total_is_lower_bound: false,
           page: 2,
+          page_size: 20,
           page_count: 0,
           last_page: 1,
           products: [],
@@ -952,6 +957,7 @@ describe('off_search_products', () => {
           total: 10_000,
           total_is_lower_bound: true,
           page: 400,
+          page_size: 20,
           page_count: 0,
           products: [],
         }),
@@ -1173,6 +1179,7 @@ describe('off_search_products', () => {
       total: 1,
       total_is_lower_bound: false,
       page: 1,
+      page_size: 20,
       page_count: 1,
       products: [
         {
@@ -1196,6 +1203,7 @@ describe('off_search_products', () => {
       total: 1,
       total_is_lower_bound: false,
       page: 1,
+      page_size: 20,
       page_count: 1,
       products: [
         {
@@ -1427,6 +1435,7 @@ describe('off_search_products', () => {
         total: 10_000,
         total_is_lower_bound: true,
         page: 1,
+        page_size: 20,
         page_count: 1,
         products: [{ barcode: '1234567890001' }],
       };
@@ -1442,6 +1451,7 @@ describe('off_search_products', () => {
         total: 42,
         total_is_lower_bound: false,
         page: 1,
+        page_size: 20,
         page_count: 1,
         products: [{ barcode: '1234567890001' }],
       };
@@ -1469,6 +1479,7 @@ describe('off_search_products', () => {
         total: 1,
         total_is_lower_bound: false,
         page: 1,
+        page_size: 20,
         page_count: 1,
         products: [{ barcode: '1234567890001', product_name: 'Frozen Pizza', categories_tags }],
       };
@@ -1486,6 +1497,7 @@ describe('off_search_products', () => {
         total: 1,
         total_is_lower_bound: false,
         page: 1,
+        page_size: 20,
         page_count: 1,
         products: [{ barcode: '1234567890001', product_name }],
       };
@@ -1502,6 +1514,7 @@ describe('off_search_products', () => {
         total: 1,
         total_is_lower_bound: false,
         page: 1,
+        page_size: 20,
         page_count: 1,
         products: [
           {
@@ -1529,6 +1542,7 @@ describe('off_search_products', () => {
           total: 1,
           total_is_lower_bound: false,
           page: 1,
+          page_size: 20,
           page_count: 1,
           products: [
             {
@@ -1763,7 +1777,9 @@ describe('off_search_products', () => {
       expect(notice).toContain('country="Never Land" was sent as "en:never-land"');
       expect(notice).toMatch(/no matching .*tag/i);
       expect(notice).toContain('allergen="Peanut" was sent as "en:peanut"');
-      expect(notice).toMatch(/could not be (checked|reached)/i);
+      expect(notice).toContain(
+        'allergen="Peanut" was sent as "en:peanut" (the tag vocabulary could not be reached or gave no usable answer, so it went unchecked)',
+      );
       // A value the vocabulary confirmed is not blamed.
       expect(notice).not.toContain('label="en:organic" was sent');
     });
@@ -2425,6 +2441,467 @@ describe('off_search_products', () => {
         /^Page 1 lists no products: 1 match on this page was left off: .* No further page of matches can be requested\.$/,
       );
       expect(contractText(result)).not.toContain('Request page 2');
+    });
+
+    it('marks an all-omitted middle page truncated, since matches lie beyond it (#55)', async () => {
+      mockSearch({ count: 40, page: 2, page_count: 0, page_size: 5, dropped: 5, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:honeys',
+        page: 2,
+        page_size: 5,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({
+        truncated: true,
+        shown: 0,
+        cap: 5,
+        last_page: 8,
+        omitted: 5,
+        notice:
+          'Page 2 lists no products: 5 matches on this page were left off: Open Food Facts stores them under codes it cannot serve, so off_get_product could not look them up either. Request page 3 for further matches.',
+      });
+      const text = contractText(result);
+      expect(text).toContain('**Page 2 lists no products** (40 total products)');
+      expect(text).toContain('Request page 3 for further matches.');
+    });
+
+    it('marks an all-omitted page cut by the tag page bound truncated, naming no next page', async () => {
+      mockSearch({ count: 315, page: 10, page_count: 0, page_size: 5, dropped: 5, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        countries_tag: 'en:mongolia',
+        page: 10,
+        page_size: 5,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ truncated: true, shown: 0, cap: 5, last_page: 10 });
+      expect(String(structured.notice)).toMatch(/No further page of matches can be requested\.$/);
+    });
+
+    it('carries no truncation on an all-omitted final page', async () => {
+      mockSearch({ count: 13, page: 3, page_count: 0, page_size: 5, dropped: 3, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:honeys',
+        page: 3,
+        page_size: 5,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ last_page: 3, omitted: 3 });
+      for (const key of ['truncated', 'shown', 'cap'] as const) {
+        expect(structured).not.toHaveProperty(key);
+      }
+      expect(String(structured.notice)).toMatch(/No further page of matches can be requested\.$/);
+    });
+
+    it('names the next page in the body of a lower-bound all-omitted page, as the notice does', async () => {
+      // last_page is withheld when the backend stopped counting, yet page 2 can still be
+      // requested: the format() body and the notice must agree on it.
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 1,
+        page_count: 0,
+        page_size: 5,
+        dropped: 5,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 1,
+        page_size: 5,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ total_is_lower_bound: true, truncated: true, omitted: 5 });
+      expect(structured).not.toHaveProperty('last_page');
+      expect(String(structured.notice)).toMatch(/Request page 2 for further matches\.$/);
+      const body = result.content?.[0];
+      expect(body?.type === 'text' ? body.text : '').toContain(
+        'Request page 2 for further matches.',
+      );
+    });
+
+    it('names no next page at the deepest reachable page of a lower-bound result set', async () => {
+      mockSearch({
+        count: 10_000,
+        count_is_exact: false,
+        page: 2000,
+        page_count: 0,
+        page_size: 5,
+        dropped: 5,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 2000,
+        page_size: 5,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(String(structured.notice)).toMatch(/No further page of matches can be requested\.$/);
+      expect(contractText(result)).not.toContain('Request page 2001');
+    });
+  });
+
+  // ── #55: truncation means more results beyond this page ───────────────────
+
+  describe('truncation on the final page (#55)', () => {
+    /** The truncation and paging-notice keys a final page must not carry. */
+    const PAGING_KEYS = ['truncated', 'shown', 'cap', 'notice'] as const;
+
+    it.each([
+      {
+        label: 'a nutrient-filtered text search on its last page',
+        args: {
+          query: 'dark chocolate',
+          nutrient_filters: [{ nutrient: 'sugars' as const, operator: 'lt' as const, value: 8 }],
+          page_size: 2,
+          page: 907,
+        },
+        response: { count: 1813, page: 907, page_count: 1, page_size: 2 },
+      },
+      {
+        label: 'a tag-filtered text search ending on a full page',
+        args: { query: 'milk', countries_tag: 'en:mongolia', page_size: 3, page: 2 },
+        response: { count: 6, page: 2, page_count: 3, page_size: 3 },
+      },
+      {
+        label: 'a text search whose window ends exactly at its last match',
+        args: { query: 'chocolate', page_size: 2, page: 5000 },
+        response: { count: TEXT_SEARCH_RESULT_WINDOW, page: 5000, page_count: 2, page_size: 2 },
+      },
+      {
+        label: 'a tag-only search ending on a full page',
+        args: { countries_tag: 'en:mongolia', page_size: 45, page: 7 },
+        response: { count: 315, page: 7, page_count: 45, page_size: 45 },
+      },
+    ])('carries no truncation or paging notice on $label', async ({ args, response }) => {
+      mockSearch({ ...response, products: [{ code: '1234567890001' }] });
+
+      const result = await runToolContract(offSearchProductsTool, args);
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.last_page).toBe(args.page);
+      for (const key of PAGING_KEYS) expect(structured).not.toHaveProperty(key);
+      const text = contractText(result);
+      expect(text).not.toMatch(/No further pages|reachable pages|Page \d+ of \d+\./);
+      expect(text).toContain(`(page ${args.page} of ${args.page},`);
+    });
+
+    it('keeps the omitted disclosure, without truncation, on a one-page result missing a row', async () => {
+      // 20 matches at page_size 20 is one page; the 20th was left off for an unservable code. The
+      // 19 rows delivered are fewer than the total, yet nothing lies beyond this page — a rule that
+      // compared the total against rows delivered would report truncation here.
+      mockSearch({
+        count: 20,
+        page: 1,
+        page_count: 19,
+        page_size: 20,
+        dropped: 1,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:honeys',
+        page: 1,
+        page_size: 20,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ last_page: 1, omitted: 1, page_count: 19 });
+      for (const key of PAGING_KEYS) expect(structured).not.toHaveProperty(key);
+      expect(contractText(result)).toContain('1 match on this page was left off');
+    });
+
+    it('keeps truncation on a short page that has further pages beyond it', async () => {
+      // 19 rows delivered at page_size 20 out of 100: the short page is a drop, not the end.
+      mockSearch({
+        count: 100,
+        page: 1,
+        page_count: 19,
+        page_size: 20,
+        dropped: 1,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:honeys',
+        page: 1,
+        page_size: 20,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        truncated: true,
+        shown: 19,
+        cap: 20,
+        last_page: 5,
+        notice: 'Page 1 of 5. Use the page parameter to fetch subsequent pages.',
+      });
+    });
+
+    // Characterization — the bound-cut and first-page cases keep their truncation and guidance.
+
+    it('keeps truncation and guidance on page 1 of a multi-page set', async () => {
+      mockSearch({
+        count: 315,
+        page: 1,
+        page_count: 45,
+        page_size: 45,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        countries_tag: 'en:mongolia',
+        page: 1,
+        page_size: 45,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        truncated: true,
+        shown: 45,
+        cap: 45,
+        last_page: 7,
+        notice: 'Page 1 of 7. Use the page parameter to fetch subsequent pages.',
+      });
+      expect(contractText(result)).toContain('Page 1 of 7.');
+    });
+
+    it('keeps truncation on the last reachable page of a tag search cut by the page bound', async () => {
+      mockSearch({
+        count: 315,
+        page: 10,
+        page_count: 5,
+        page_size: 5,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        countries_tag: 'en:mongolia',
+        page: 10,
+        page_size: 5,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ truncated: true, shown: 5, cap: 5, last_page: 10 });
+      expect(String(structured.notice)).toContain('63 pages of matches exist');
+      expect(String(structured.notice)).toContain('as deep as a tag-only search paginates');
+    });
+  });
+
+  // ── #57: an over-cap page_size is served at 50 ────────────────────────────
+
+  describe('page_size above the per-call cap (#57)', () => {
+    /** One page of a counted tag search, filled to `page_count` placeholder rows. */
+    function mockTagPage(count: number, page: number, pageCount: number): void {
+      mockSearch({
+        count,
+        page,
+        page_count: pageCount,
+        page_size: 50,
+        products: Array.from({ length: pageCount }, (_, i) => ({
+          code: String(1_000_000_000_000 + (page - 1) * 50 + i),
+        })),
+      });
+    }
+
+    it('accepts page_size up to 10,000 and rejects 10,001 before any work', async () => {
+      expect(offSearchProductsTool.input.safeParse({ query: 'x', page_size: 10_000 }).success).toBe(
+        true,
+      );
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page_size: 10_001,
+      });
+      expect(result.isError).toBe(true);
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('sends page_size 50 for page_size 51 and discloses it on both surfaces', async () => {
+      mockTagPage(163, 1, 50);
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page_size: 51,
+      });
+
+      expect(mockSearchProducts).toHaveBeenCalledWith(
+        expect.objectContaining({ page: 1, page_size: 50 }),
+        expect.anything(),
+      );
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ page_size: 50, last_page: 4, cap: 50, shown: 50 });
+      expect(structured.page_size_capped).toBe(
+        'page_size 51 is above the 50 results one call returns; this page was served at page_size 50. Pages are counted at that size: request page 2 for results 51–100.',
+      );
+      const text = contractText(result);
+      expect(text).toContain('page_size 51 is above the 50 results one call returns');
+      expect(text).toContain('(page 1 of 4, 50 per page, showing 50)');
+    });
+
+    it.each([20, 50])('echoes page_size %i without a page_size_capped disclosure', async (size) => {
+      mockTagPage(163, 1, Math.min(size, 50));
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page_size: size,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.page_size).toBe(size);
+      expect(structured).not.toHaveProperty('page_size_capped');
+      expect(structured.cap).toBe(size);
+      expect(contractText(result)).not.toMatch(/above the 50 results/);
+    });
+
+    it('pages an over-cap page_size contiguously at 50, ending on a short page', async () => {
+      // 90 matches at page_size 80: page 1 is results 1–50 and page 2 is results 51–90. The last
+      // page is short, so a rule keyed on the size asked for (80) and one keyed on the size served
+      // (50) disagree about it.
+      mockTagPage(90, 1, 50);
+      const first = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page: 1,
+        page_size: 80,
+      });
+      mockTagPage(90, 2, 40);
+      const second = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page: 2,
+        page_size: 80,
+      });
+
+      expect(
+        mockSearchProducts.mock.calls.map(([params]) => [params.page, params.page_size]),
+      ).toEqual([
+        [1, 50],
+        [2, 50],
+      ]);
+      expect(first.structuredContent).toMatchObject({ last_page: 2, truncated: true, cap: 50 });
+      expect(
+        String((first.structuredContent as Record<string, unknown>).page_size_capped),
+      ).toContain('request page 2 for results 51–90');
+      const secondOut = second.structuredContent as Record<string, unknown>;
+      expect(secondOut).toMatchObject({ page: 2, last_page: 2, page_size: 50, page_count: 40 });
+      expect(secondOut).not.toHaveProperty('truncated');
+      expect(secondOut.page_size_capped).toBe(
+        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50.',
+      );
+    });
+
+    it('rejects a text page past the window at the served size, hinting page_size 50', async () => {
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 201,
+        page_size: 80,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'page_out_of_range', page: 201, page_size: 50, max_page: 200 } },
+      });
+      expect(contractHint(result)).toBe(
+        'Request page 200 or lower at page_size 50, or add filters so the products you need rank inside the first 10000 results.',
+      );
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('sends page 200 of a text search at page_size 50 for page_size 80', async () => {
+      mockSearch({
+        count: 12_000,
+        page: 200,
+        page_count: 50,
+        page_size: 50,
+        products: [{ code: '1234567890001' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 200,
+        page_size: 80,
+      });
+
+      expect(mockSearchProducts).toHaveBeenCalledWith(
+        expect.objectContaining({ page: 200, page_size: 50 }),
+        expect.anything(),
+      );
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ last_page: 200, cap: 50, truncated: true });
+      // Page 201 is past the window, so the disclosure names no next page.
+      expect(structured.page_size_capped).toBe(
+        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50.',
+      );
+    });
+
+    it('names the tag-path reach at the served size when the page is past 10', async () => {
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:pizzas',
+        page: 11,
+        page_size: 80,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'page_out_of_range', page_size: 50, max_page: 10 } },
+      });
+      expect(contractHint(result)).toContain('at page_size 50 that reaches the first 500 matches');
+    });
+
+    it('still rejects predicate lists past their bounds, since dropping entries changes the query', async () => {
+      const over = {
+        exclude_allergens: Array.from({ length: 15 }, () => 'en:milk'),
+        exclude_traces: Array.from({ length: 15 }, () => 'en:nuts'),
+        labels_tag: Array.from({ length: 11 }, () => 'en:organic'),
+        nutrient_filters: Array.from({ length: 19 }, () => ({
+          nutrient: 'sugars',
+          operator: 'lt',
+          value: 8,
+        })),
+      };
+      for (const [key, value] of Object.entries(over)) {
+        expect(offSearchProductsTool.input.safeParse({ [key]: value }).success, key).toBe(false);
+      }
+
+      const words = Array.from({ length: 25 }, (_, i) => `word${i}`).join(' ');
+      const result = await runToolContract(offSearchProductsTool, { query: words });
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'query_too_long' } },
+      });
+      expect(mockSearchProducts).not.toHaveBeenCalled();
+    });
+
+    it('names no next page on a capped page cut by the tag page bound, as its description says', async () => {
+      mockTagPage(501, 10, 50);
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page: 10,
+        page_size: 80,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ truncated: true, last_page: 10 });
+      expect(structured.page_size_capped).toBe(
+        'page_size 80 is above the 50 results one call returns; this page was served at page_size 50.',
+      );
+      const { page_size_capped } = offSearchProductsTool.enrichment as unknown as Record<
+        string,
+        { description?: string }
+      >;
+      expect(page_size_capped?.description).toContain(
+        'when a further page holds matches and can be requested',
+      );
+    });
+
+    it('says what happens above the cap in the page_size description', () => {
+      expect(inputDescription('page_size')).toMatch(/served at 50/);
+      expect(inputDescription('page')).toMatch(/page 2 at page_size 80 is results 51–100/);
     });
   });
 

@@ -16,8 +16,11 @@ import {
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import {
   INGREDIENTS_ANALYSIS_TAGS,
+  type IndexedNutrientKey,
+  indexedNutrientKey,
   NUTRIENT_FIELDS,
   NUTRIENT_OPERATORS,
+  type NutrientFilter,
   type NutrientOperator,
   type SearchParams,
 } from '@/services/openfoodfacts/types.js';
@@ -27,6 +30,12 @@ import {
   type TagFacet,
 } from '@/services/taxonomy/taxonomy-service.js';
 import { mdInline } from '@/utils/markdown.js';
+
+/**
+ * Most results one search call returns. A larger `page_size`, up to the 10,000 results no backend
+ * serves past, is served at this size and disclosed, and `page` then counts pages of this size.
+ */
+const SEARCH_PAGE_SIZE_CAP = 50;
 
 /** Comparison symbol per operator, for echoing a constraint back to the caller in the notice. */
 const NUTRIENT_OPERATOR_SYMBOLS: Record<NutrientOperator, string> = {
@@ -123,7 +132,8 @@ function omittedSentence(count: number): string {
 const UNCONFIRMED_TAG_REASONS = {
   no_vocabulary: 'brand slugs have no vocabulary to check them against',
   no_match: 'no matching Open Food Facts tag was found',
-  lookup_failed: 'the tag vocabulary could not be reached to check it',
+  lookup_failed:
+    'the tag vocabulary could not be reached or gave no usable answer, so it went unchecked',
 } as const;
 
 /**
@@ -156,6 +166,41 @@ function liveDatabaseRoute(
   };
 }
 
+/** The unit an indexed nutrient value is in: energy in kcal, everything else in grams. */
+function indexedUnit(key: string): 'kcal' | 'g' {
+  return key === 'energy_kcal_100g' ? 'kcal' : 'g';
+}
+
+/**
+ * One optional number per filterable nutrient, under the key `off_get_product` uses for it, so a
+ * row's value and the product's current value line up by name.
+ */
+const INDEXED_NUTRIMENTS_SHAPE = Object.fromEntries(
+  NUTRIENT_FIELDS.map((nutrient) => {
+    const key = indexedNutrientKey(nutrient);
+    const label = nutrient === 'energy-kcal' ? 'Energy' : nutrient.replace(/-/g, ' ');
+    return [
+      key,
+      z
+        .number()
+        .optional()
+        .describe(
+          `${label[0]?.toUpperCase()}${label.slice(1)} in ${indexedUnit(key)} per 100 g, or per 100 ml for liquids, as the text index holds it. Absent when this nutrient was not constrained or the index holds no value for it.`,
+        ),
+    ];
+  }),
+) as Record<IndexedNutrientKey, z.ZodOptional<z.ZodNumber>>;
+
+/** The constraints as the caller wrote them, for echoing: `sugars < 8, proteins >= 5`. */
+function constraintEcho(filters: readonly NutrientFilter[]): string {
+  return filters
+    .map(
+      ({ nutrient, operator, value }) =>
+        `${nutrient} ${NUTRIENT_OPERATOR_SYMBOLS[operator]} ${value}`,
+    )
+    .join(', ');
+}
+
 /**
  * Freshness disclosure attached to every response the text backend answered. No date is named:
  * the endpoint publishes no index timestamp, and deriving one would cost an extra search request
@@ -168,7 +213,7 @@ const TEXT_INDEX_SNAPSHOT_NOTE =
 export const offSearchProductsTool = tool('off_search_products', {
   title: 'Search Food Products',
   description:
-    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name, generic name, categories, labels, or brand, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); numeric nutrient_filters express per-100 g thresholds such as sugars below 8 g and combine the same way; additives_tag is the one exception, filtering only on searches carrying neither query nor nutrient_filters. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query is answered by the text index, a snapshot that lags the live database, while a tag-only search reads the live database and is current — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Search Open Food Facts by full-text query, structured tag filters, or both at once. Returns a summary list with barcodes, product names, brands, Nutri-Score, NOVA group, and categories — enough for triage and selection, not full label data. Use off_get_product on the returned barcodes for complete details. A text query and tag filters combine: every word of the query must match the product name, generic name, categories, labels, or brand, and every filter provided must hold (e.g. query "dark chocolate" with labels_tag "en:organic" and countries_tag "en:france" returns organic chocolate sold in France); numeric nutrient_filters express thresholds per 100 g, or per 100 ml for liquids, such as sugars below 8 g, and combine the same way, and each row then carries the indexed values the thresholds were checked against; additives_tag is the one exception, filtering only on searches carrying neither query nor nutrient_filters. Tag filter values are canonical tag IDs (e.g. "en:organic", "en:no-gluten") — use off_browse_taxonomy to resolve human terms to tag IDs. A case variant, synonym, or singular of a tag is resolved to its canonical ID where Open Food Facts recognizes it; anything else is matched exactly. exclude_allergens and exclude_traces drop products that declare an allergen or a "may contain" trace, but a product with no allergen or trace data entered passes them, so confirm a candidate with off_get_product before relying on it. At least one search parameter is required. The two paths read different indexes: a search carrying query is answered by the text index, a snapshot that lags the live database, while a tag-only search reads the live database and is current — so a recently contributed product can be missing from a text search and present in the same search without query. Data is crowd-sourced; result count reflects contributed products, not all products in the market. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -176,7 +221,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        `Words to find. Every word must match the product name, generic name, categories, labels, or brand — ingredients and quantity are not searched — so put only words the product itself would carry. Stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit", …) are not required, and neither is a content word that is a stop word in one of them (such as Spanish "soy"), though it still ranks the results. Names are matched in the ${TEXT_SEARCH_LANGS.length} languages the text index analyzes, so a product named only in French is found by its French name. At most ${MAX_QUERY_WORDS} words, counting each part of a hyphenated word. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database; drop it to run the same tag filters against the current data.`,
+        `Words to find. Every word must match the product name, generic name, categories, labels, or brand — ingredients and quantity are not searched — so put only words the product itself would carry. Punctuation separates words — except an underscore, an apostrophe or period inside a word, and a decimal comma inside a number — so each part of "milk-chocolate" or "salt/pepper" must match, while "l'eau" and "1,5" stay one word. Stop words of English, French, Spanish, German, and Italian ("with", "the", "de", "mit", …) are not required, and neither is a content word that is a stop word in one of them (such as Spanish "soy"), though it still ranks the results. Names are matched in the ${TEXT_SEARCH_LANGS.length} languages the text index analyzes, so a product named only in French is found by its French name. At most ${MAX_QUERY_WORDS} words, counted as runs of letters and digits, so each part of a hyphenated or apostrophe-joined word counts. Example: "dark chocolate 70%". Supplying it routes the search to the text index, a snapshot that lags the live Open Food Facts database; drop it to run the same tag filters against the current data.`,
       ),
     categories_tag: z
       .string()
@@ -267,7 +312,7 @@ export const offSearchProductsTool = tool('off_search_products', {
             nutrient: z
               .enum(NUTRIENT_FIELDS)
               .describe(
-                'Nutrient to constrain, measured per 100 g. Energy is kilocalories; every other value is grams per 100 g.',
+                'Nutrient to constrain, measured per 100 g, or per 100 ml for liquids. Energy is kilocalories; every other value is grams.',
               ),
             operator: z
               .enum(NUTRIENT_OPERATORS)
@@ -277,14 +322,18 @@ export const offSearchProductsTool = tool('off_search_products', {
             value: z
               .number()
               .min(0)
-              .describe("Threshold to compare against, in the nutrient's per-100 g unit."),
+              .describe(
+                'Threshold to compare against: kilocalories for energy, grams for every other nutrient, per 100 g, or per 100 ml for liquids.',
+              ),
           })
-          .describe('One numeric constraint on a per-100 g nutrient value.'),
+          .describe(
+            'One numeric constraint on a nutrient value per 100 g, or per 100 ml for liquids.',
+          ),
       )
       .max(18)
       .optional()
       .describe(
-        'Numeric constraints on nutrient values per 100 g, combined as AND with each other and with every other filter. Pair two entries on the same nutrient to express a range (e.g. sugars gte 2 and sugars lte 8). Served only by the text backend, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the 10,000-result page window, and additives_tag cannot be combined with it. Per-serving and prepared-product values are not searchable.',
+        'Numeric constraints on nutrient values per 100 g, or per 100 ml for liquids, combined as AND with each other and with every other filter. Pair two entries on the same nutrient to express a range (e.g. sugars gte 2 and sugars lte 8). Served only by the text backend, so supplying one routes the search there even without query — it then reads the lagging text index and is subject to the 10,000-result page window, and additives_tag cannot be combined with it. Per-serving and prepared-product values are not searchable.',
       ),
     sort_by: z
       .enum(['last_modified_t', 'unique_scans_n', 'created_t', 'popularity_key'])
@@ -298,16 +347,16 @@ export const offSearchProductsTool = tool('off_search_products', {
       .min(1)
       .default(1)
       .describe(
-        `Page number (1-based). Use with page_size to paginate results. A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size 50 it reaches the first ${TAG_SEARCH_MAX_PAGE * 50} matches. A search carrying query or nutrient_filters serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past either bound is rejected rather than sent; narrow the filters or change sort_by to bring other products forward.`,
+        `Page number (1-based). Use with page_size to paginate results. Pages are counted at the page_size served, which is at most ${SEARCH_PAGE_SIZE_CAP}, so repeating one larger page_size pages contiguously (page 2 at page_size 80 is results 51–100). A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only, so at page_size ${SEARCH_PAGE_SIZE_CAP} it reaches the first ${TAG_SEARCH_MAX_PAGE * SEARCH_PAGE_SIZE_CAP} matches. A search carrying query or nutrient_filters serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, so page * page_size (as served) must stay at or below ${TEXT_SEARCH_RESULT_WINDOW}. A request past either bound is rejected rather than sent; narrow the filters or change sort_by to bring other products forward.`,
       ),
     page_size: z
       .number()
       .int()
       .min(1)
-      .max(50)
+      .max(TEXT_SEARCH_RESULT_WINDOW)
       .default(20)
       .describe(
-        'Results per page (1–50, default 20). Keep low for initial exploration; increase for comparison workflows.',
+        `Results per page (default 20). One call returns at most ${SEARCH_PAGE_SIZE_CAP}: a larger value, up to ${TEXT_SEARCH_RESULT_WINDOW} (no backend serves past result ${TEXT_SEARCH_RESULT_WINDOW}), is served at ${SEARCH_PAGE_SIZE_CAP}, reported in page_size and page_size_capped, and page then counts pages of ${SEARCH_PAGE_SIZE_CAP}. Keep low for initial exploration; increase for comparison workflows.`,
       ),
   }),
 
@@ -323,6 +372,11 @@ export const offSearchProductsTool = tool('off_search_products', {
         'True when the backend stopped counting at its ceiling and total is a floor, not the match total. Only text searches can hit it; add filters to bring the result set under the ceiling and get an exact count.',
       ),
     page: z.number().describe('Current page number (1-based).'),
+    page_size: z
+      .number()
+      .describe(
+        `The page_size served: the one requested, or ${SEARCH_PAGE_SIZE_CAP} when a larger one was requested. page and last_page count pages of this size.`,
+      ),
     page_count: z
       .number()
       .describe(
@@ -332,7 +386,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       .number()
       .optional()
       .describe(
-        `Deepest page of this result set that holds products and can be requested, at the page_size used — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone and by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers. Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all.`,
+        `Deepest page of this result set that holds products and can be requested, at the page_size served — capped at page ${TAG_SEARCH_MAX_PAGE} on a search by tag filters alone and by the ${TEXT_SEARCH_RESULT_WINDOW}-result window on a search the text index answers. Absent when total_is_lower_bound is true — the total it would divide is the ceiling the backend stopped counting at, so no exact last page exists — and when nothing matched at all.`,
       ),
     omitted: z
       .number()
@@ -379,6 +433,12 @@ export const offSearchProductsTool = tool('off_search_products', {
               .describe(
                 'Category tag IDs in canonical form. Use as filter values for off_search_products.',
               ),
+            indexed_nutriments: z
+              .object(INDEXED_NUTRIMENTS_SHAPE)
+              .optional()
+              .describe(
+                'Present on every row of a search carrying nutrient_filters, and only there: the values the text index holds for the constrained nutrients, per 100 g, or per 100 ml for liquids — the values the filters were checked against. Keyed as off_get_product keys them (sugars_100g, energy_kcal_100g). A nutrient the index holds no value for is left out, never zero-filled, so the object can be empty. off_get_product returns the current record, whose values can differ.',
+              ),
           })
           .describe('A single matching product summary row.'),
       )
@@ -390,13 +450,13 @@ export const offSearchProductsTool = tool('off_search_products', {
       .string()
       .optional()
       .describe(
-        'Guidance about this result set — echoes the filters and suggests how to broaden when nothing matched, or names the current page and how far the backend will actually paginate when more results exist.',
+        'Guidance about this result set — echoes the filters and suggests how to broaden when nothing matched, names the current page and how far the backend will actually paginate when more results exist, or, on a page that returned no rows because it lies past the last match or every row was left off, says which page to request instead.',
       ),
     text_index_snapshot: z
       .string()
       .optional()
       .describe(
-        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. Absent on tag-only searches, which read the live database.',
+        'Present only on searches the text backend answered. States that those results come from an index snapshot that lags the live Open Food Facts database, so a recently contributed product can be missing from them while the tag-only path still returns it. On a search carrying nutrient_filters it also echoes the constraints and says they were checked against the index values each row carries as indexed_nutriments, which can differ from what off_get_product returns. Absent on tag-only searches, which read the live database.',
       ),
     exclusion_coverage: z
       .string()
@@ -404,7 +464,18 @@ export const offSearchProductsTool = tool('off_search_products', {
       .describe(
         'Present only on searches carrying exclude_allergens or exclude_traces. States that products with no allergen or trace data entered pass an exclusion, so a result is not confirmed free of the excluded allergens, and names the off_get_product fields to check.',
       ),
-    truncated: z.boolean().optional().describe('True when more results exist beyond this page.'),
+    page_size_capped: z
+      .string()
+      .optional()
+      .describe(
+        `Present only when page_size was above ${SEARCH_PAGE_SIZE_CAP}: names the page_size requested and the ${SEARCH_PAGE_SIZE_CAP} served, and, when a further page holds matches and can be requested, the page to request next and the results it holds.`,
+      ),
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when more results exist beyond this page. Absent on the final page of a result set.',
+      ),
     shown: z.number().optional().describe('Number of products returned on this page.'),
     cap: z.number().optional().describe('The page_size that was applied.'),
   },
@@ -412,6 +483,7 @@ export const offSearchProductsTool = tool('off_search_products', {
   enrichmentTrailer: {
     text_index_snapshot: { label: 'Index freshness' },
     exclusion_coverage: { label: 'Exclusions' },
+    page_size_capped: { label: 'Page size' },
   },
 
   errors: [
@@ -426,7 +498,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'unrecognized_exclusion',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'An exclude_allergens or exclude_traces value is not an allergen tag the Open Food Facts vocabulary confirms, or the vocabulary could not be reached to check it — an unrecognized exclusion would exclude nothing',
+      when: 'An exclude_allergens or exclude_traces value is not an allergen tag the Open Food Facts vocabulary confirms, or the vocabulary could not be reached or gave no usable answer when checking it — an unrecognized exclusion would exclude nothing',
       retryable: false,
       severity: 'warning',
       recovery:
@@ -452,7 +524,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'page_out_of_range',
       code: JsonRpcErrorCode.ValidationError,
-      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE}, or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window`,
+      when: `A search by tag filters alone asks for a page past ${TAG_SEARCH_MAX_PAGE}, or a search the text backend serves asks for page * page_size beyond its ${TEXT_SEARCH_RESULT_WINDOW}-result window, counting page_size at the ${SEARCH_PAGE_SIZE_CAP} served when a larger one was requested`,
       retryable: false,
       severity: 'warning',
       recovery:
@@ -461,7 +533,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, reports a search-engine failure inside an HTTP 200, answers 2xx with a malformed envelope, or is unreachable',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -503,10 +575,13 @@ export const offSearchProductsTool = tool('off_search_products', {
     // that path — the result window, the lagging index, the absent additives facet — with or
     // without a query.
     const servedByTextBackend = Boolean(query) || nutrientFilters.length > 0;
+    // Every page computation below — what is sent, the page bounds, last_page, truncation — runs at
+    // the size served, so a repeated over-cap page_size pages contiguously in pages of the cap.
+    const pageSize = Math.min(input.page_size, SEARCH_PAGE_SIZE_CAP);
     // The deepest page this search's backend serves: the text backend's result window at this
     // page_size, or the tag path's page bound.
     const maxPage = servedByTextBackend
-      ? Math.floor(TEXT_SEARCH_RESULT_WINDOW / input.page_size)
+      ? Math.floor(TEXT_SEARCH_RESULT_WINDOW / pageSize)
       : TAG_SEARCH_MAX_PAGE;
     const hasExclusion = EXCLUSION_FILTERS.some(({ key }) => tagValues(input[key]).length > 0);
     const hasFilter =
@@ -553,10 +628,10 @@ export const offSearchProductsTool = tool('off_search_products', {
         `A search by tag filters alone is served through page ${TAG_SEARCH_MAX_PAGE} only, and page ${input.page} was requested.`,
         {
           page: input.page,
-          page_size: input.page_size,
+          page_size: pageSize,
           max_page: TAG_SEARCH_MAX_PAGE,
           recovery: {
-            hint: `Request page ${TAG_SEARCH_MAX_PAGE} or lower — at page_size ${input.page_size} that reaches the first ${TAG_SEARCH_MAX_PAGE * input.page_size} matches — or narrow the filters or change sort_by to bring the products you need forward.`,
+            hint: `Request page ${TAG_SEARCH_MAX_PAGE} or lower — at page_size ${pageSize} that reaches the first ${TAG_SEARCH_MAX_PAGE * pageSize} matches — or narrow the filters or change sort_by to bring the products you need forward.`,
           },
         },
       );
@@ -565,17 +640,21 @@ export const offSearchProductsTool = tool('off_search_products', {
     // The text backend refuses page * page_size beyond its result window with an HTTP 400 that no
     // retry can clear. Reject it here so the caller gets the reachable page bound instead of a
     // backoff sequence.
-    if (servedByTextBackend && input.page * input.page_size > TEXT_SEARCH_RESULT_WINDOW) {
+    if (servedByTextBackend && input.page * pageSize > TEXT_SEARCH_RESULT_WINDOW) {
+      const served =
+        pageSize < input.page_size
+          ? `page_size ${input.page_size} served at ${pageSize}`
+          : `page_size ${pageSize}`;
       throw ctx.fail(
         'page_out_of_range',
-        `The text backend serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, and page ${input.page} at page_size ${input.page_size} asks for result ${input.page * input.page_size}.`,
+        `The text backend serves only the first ${TEXT_SEARCH_RESULT_WINDOW} results, and page ${input.page} at ${served} asks for result ${input.page * pageSize}.`,
         {
           page: input.page,
-          page_size: input.page_size,
+          page_size: pageSize,
           max_page: maxPage,
           result_window: TEXT_SEARCH_RESULT_WINDOW,
           recovery: {
-            hint: `Request page ${maxPage} or lower at page_size ${input.page_size}, or add filters so the products you need rank inside the first ${TEXT_SEARCH_RESULT_WINDOW} results.`,
+            hint: `Request page ${maxPage} or lower at page_size ${pageSize}, or add filters so the products you need rank inside the first ${TEXT_SEARCH_RESULT_WINDOW} results.`,
           },
         },
       );
@@ -583,8 +662,8 @@ export const offSearchProductsTool = tool('off_search_products', {
 
     // The text backend's tag fields are exact-match keywords, so a value the tag path would
     // canonicalize (case, synonym, singular, missing prefix) matches nothing there. Canonicalize
-    // each value first; resolution is best-effort and never fails the search. The tag path is left
-    // alone — Product Opener canonicalizes its parameters itself.
+    // each value first; resolution is best-effort and fails the search only when the caller
+    // cancels. The tag path is left alone — Product Opener canonicalizes its parameters itself.
     //
     // Exclusions are canonicalized on both paths and must be confirmed: a value neither backend
     // recognizes is a negation that matches nothing, so it would exclude nothing and return every
@@ -621,13 +700,14 @@ export const offSearchProductsTool = tool('off_search_products', {
         : [],
     );
     if (unrecognized.length > 0) {
-      // A refusal the vocabulary could not be reached to settle can succeed on a retry; one it
-      // answered cannot, so the retry flag holds only when every refusal is of the first kind.
+      // A refusal the vocabulary could not settle — unreachable, or no usable answer — can succeed
+      // on a retry; one it answered cannot, so the retry flag holds only when every refusal is of
+      // the first kind.
       const retryable = unrecognized.every(({ reason }) => reason === 'lookup_failed');
       const listed = unrecognized
         .map(({ field, value, reason }) =>
           reason === 'lookup_failed'
-            ? `${field} "${value}" could not be checked, because the allergen vocabulary could not be reached`
+            ? `${field} "${value}" could not be checked, because the allergen vocabulary could not be reached or gave no usable answer`
             : `${field} "${value}" is not an allergen tag ID or name the Open Food Facts vocabulary confirms`,
         )
         .join('; ');
@@ -639,7 +719,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           retryable,
           ...(retryable && {
             recovery: {
-              hint: 'Retry shortly — the allergen vocabulary could not be reached to confirm the value. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without it.',
+              hint: 'Retry shortly — the allergen vocabulary could not be reached or gave no usable answer, so the value went unconfirmed. The canonical IDs of the 14 major allergens, such as "en:nuts" or "en:milk", are confirmed without it.',
             },
           }),
         },
@@ -649,7 +729,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     const svc = getOpenFoodFactsService();
     const searchParams: SearchParams = {
       page: input.page,
-      page_size: input.page_size,
+      page_size: pageSize,
     };
     if (query) searchParams.query = query;
     for (const { key } of TAG_FILTERS) {
@@ -684,7 +764,13 @@ export const offSearchProductsTool = tool('off_search_products', {
         Boolean(input.nova_group),
     );
     if (servedByTextBackend) {
-      ctx.enrich({ text_index_snapshot: `${TEXT_INDEX_SNAPSHOT_NOTE} ${liveRoute.note}` });
+      const checkedAgainst =
+        nutrientFilters.length > 0
+          ? ` The nutrient constraints (${constraintEcho(nutrientFilters)}) were checked against these index values, shown on each row as indexed_nutriments; off_get_product returns the current record, whose values can differ.`
+          : '';
+      ctx.enrich({
+        text_index_snapshot: `${TEXT_INDEX_SNAPSHOT_NOTE} ${liveRoute.note}${checkedAgainst}`,
+      });
     }
     const exclusionCoverage = exclusionCoverageNote(exclusions);
     if (exclusionCoverage) ctx.enrich({ exclusion_coverage: exclusionCoverage });
@@ -697,22 +783,45 @@ export const offSearchProductsTool = tool('off_search_products', {
     });
 
     // Pages the backend will actually serve, not pages implied by the match total.
-    const totalPages = Math.ceil(response.count / input.page_size);
+    const totalPages = Math.ceil(response.count / pageSize);
     const reachablePages = Math.min(totalPages, maxPage);
     // Only a counted total yields a real last page: dividing a count the backend stopped
     // incrementing would present its ceiling as a measurement.
     const lastPage = response.count_is_exact && response.count > 0 ? reachablePages : undefined;
+    // Matches exist past this page when the backend stopped counting, or when the pages up to and
+    // including this one, at the size served, end before the total. Keyed on the page's offset,
+    // never on the rows it delivered: a row left off for an unservable code shortens the page
+    // without leaving anything beyond it.
+    const moreBeyond = !response.count_is_exact || response.page * pageSize < response.count;
+
+    if (pageSize < input.page_size) {
+      // The rest of what was asked for starts on the next page, so name that call when one holds
+      // matches and can be requested.
+      const firstNext = response.page * pageSize + 1;
+      const lastNext = (response.page + 1) * pageSize;
+      const next =
+        response.page < reachablePages
+          ? ` Pages are counted at that size: request page ${response.page + 1} for results ${firstNext}–${response.count_is_exact ? Math.min(lastNext, response.count) : lastNext}.`
+          : '';
+      ctx.enrich({
+        page_size_capped: `page_size ${input.page_size} is above the ${SEARCH_PAGE_SIZE_CAP} results one call returns; this page was served at page_size ${pageSize}.${next}`,
+      });
+    }
 
     if (response.products.length === 0 && response.dropped > 0) {
       // Every match on this page was left off for a code no product lookup can serve. The page
       // is not past the end, and the filters are matching products, so neither notice applies.
-      ctx.enrich({
-        notice:
-          `Page ${response.page} lists no products: ${omittedSentence(response.dropped)} ` +
-          (response.page < reachablePages
-            ? `Request page ${response.page + 1} for further matches.`
-            : 'No further page of matches can be requested.'),
-      });
+      // Truncation follows the same offset rule as a page that kept its rows.
+      const notice =
+        `Page ${response.page} lists no products: ${omittedSentence(response.dropped)} ` +
+        (response.page < reachablePages
+          ? `Request page ${response.page + 1} for further matches.`
+          : 'No further page of matches can be requested.');
+      if (moreBeyond) {
+        ctx.enrich.truncated({ shown: response.page_count, cap: pageSize, guidance: notice });
+      } else {
+        ctx.enrich({ notice });
+      }
     } else if (response.products.length === 0 && response.count > 0) {
       // An empty page inside a positive result set is an exhausted page, not a zero-match search.
       // Both backends reach it with an ordinary HTTP 200, so nothing upstream distinguishes the
@@ -791,8 +900,9 @@ export const offSearchProductsTool = tool('off_search_products', {
         );
         ctx.enrich({ notice: `${echo} ${causes.join(' ')}` });
       }
-    } else if (response.count > response.page_count) {
-      // Disclose when the page is smaller than the total result set.
+    } else if (moreBeyond) {
+      // Disclose when matches exist past this page. A final page — every match up to the total
+      // already paged through — carries no disclosure, like a single-page result.
       let position: string;
       if (!response.count_is_exact) {
         // totalPages is derived from a count the backend stopped incrementing, so stating it would
@@ -810,14 +920,11 @@ export const offSearchProductsTool = tool('off_search_products', {
         position = `Page ${response.page} of ${totalPages}.`;
       }
 
-      // The page bound cut the result set when matches exist past the reachable pages — or may,
-      // when the backend stopped counting. Otherwise the last reachable page is simply the last.
-      const cutByPageBound = !response.count_is_exact || reachablePages < totalPages;
+      // Matches exist beyond this page, so a page at or past the reachable bound means the bound
+      // cut the result set.
       let nextStep: string;
       if (response.page < reachablePages) {
         nextStep = 'Use the page parameter to fetch subsequent pages.';
-      } else if (!cutByPageBound) {
-        nextStep = 'No further pages of matches exist.';
       } else if (servedByTextBackend) {
         // Already at the deepest page this backend serves. Pointing at the page parameter here
         // would send the caller into the rejection the pre-flight check exists to prevent.
@@ -830,7 +937,7 @@ export const offSearchProductsTool = tool('off_search_products', {
 
       ctx.enrich.truncated({
         shown: response.page_count,
-        cap: input.page_size,
+        cap: pageSize,
         guidance: `${position} ${nextStep}`,
       });
     }
@@ -843,12 +950,14 @@ export const offSearchProductsTool = tool('off_search_products', {
       ...(typeof p.nova_group === 'number' && { nova_group: p.nova_group }),
       ...(p.ecoscore_grade && { ecoscore_grade: p.ecoscore_grade }),
       ...(p.categories_tags && { categories_tags: p.categories_tags }),
+      ...(p.indexed_nutriments && { indexed_nutriments: p.indexed_nutriments }),
     }));
 
     return {
       total: response.count,
       total_is_lower_bound: !response.count_is_exact,
       page: response.page,
+      page_size: pageSize,
       page_count: response.page_count,
       ...(lastPage !== undefined && { last_page: lastPage }),
       ...(response.dropped > 0 && { omitted: response.dropped }),
@@ -876,7 +985,15 @@ export const offSearchProductsTool = tool('off_search_products', {
         `*${omittedSentence(result.omitted)}*`,
       ];
       if (result.total_is_lower_bound) onlyOmitted.push(lowerBoundCaveat);
-      if (result.last_page !== undefined && result.page < result.last_page) {
+      // The handler's reachable bound, rebuilt from the output: last_page when the count is exact,
+      // and otherwise the text backend's result window — only that backend stops counting.
+      const reachable =
+        result.last_page ??
+        Math.min(
+          Math.ceil(result.total / result.page_size),
+          Math.floor(TEXT_SEARCH_RESULT_WINDOW / result.page_size),
+        );
+      if (result.page < reachable) {
         onlyOmitted.push('', `Request page ${result.page + 1} for further matches.`);
       }
       return [{ type: 'text' as const, text: onlyOmitted.join('\n') }];
@@ -899,7 +1016,7 @@ export const offSearchProductsTool = tool('off_search_products', {
     }
 
     const lines: string[] = [
-      `**${totalLabel} total products** (page ${result.page}${result.last_page === undefined ? '' : ` of ${result.last_page}`}, showing ${result.page_count})`,
+      `**${totalLabel} total products** (page ${result.page}${result.last_page === undefined ? '' : ` of ${result.last_page}`}, ${result.page_size} per page, showing ${result.page_count})`,
     ];
     if (result.total_is_lower_bound) {
       lines.push(lowerBoundCaveat);
@@ -926,6 +1043,14 @@ export const offSearchProductsTool = tool('off_search_products', {
         // Rendered in full — structuredContent already carries every tag, so slicing here only
         // left text-only clients with a short list they had no way to complete.
         lines.push(`**Categories:** ${p.categories_tags.map(mdInline).join(', ')}`);
+      }
+      if (p.indexed_nutriments) {
+        const values = Object.entries(p.indexed_nutriments).map(
+          ([key, value]) => `${key} ${value} ${indexedUnit(key)}`,
+        );
+        lines.push(
+          `**Indexed per 100 g, or per 100 ml for liquids:** ${values.length > 0 ? values.join(', ') : 'none returned for the constrained nutrients'}`,
+        );
       }
       lines.push('');
     }

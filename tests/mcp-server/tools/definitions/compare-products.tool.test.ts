@@ -5,7 +5,7 @@
 
 import { rateLimited, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
   getOpenFoodFactsService: vi.fn(),
@@ -14,6 +14,7 @@ vi.mock('@/services/openfoodfacts/openfoodfacts-service.js', () => ({
 import { offCompareProductsTool } from '@/mcp-server/tools/definitions/compare-products.tool.js';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { ACCEPTED_BARCODES, REJECTED_BARCODES } from '../../../fixtures/barcode-cases.js';
+import { PRODUCT_FOUND, PRODUCT_NOT_FOUND_404 } from '../../../fixtures/upstream-envelopes.js';
 
 const mockGetProductFields = vi.fn();
 
@@ -36,7 +37,44 @@ function firstText(blocks: ReturnType<NonNullable<typeof offCompareProductsTool.
   return block.text;
 }
 
+/** Concatenates every text block of a `runToolContract` result — format() output plus trailer. */
+function contractText(result: { content?: { type: string; text?: string }[] }): string {
+  return (result.content ?? [])
+    .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
+    .join('\n');
+}
+
+/** Wrap a JSON body + status in a minimal Response-like mock, as a real fetch would resolve. */
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers({ 'content-type': 'application/json' }),
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  } as unknown as Response;
+}
+
+/**
+ * Serve the tool from the real service, so a test can run checks that live in its fetch path —
+ * the module-wide stub above bypasses them. Pair it with a stubbed global fetch.
+ */
+async function useRealService(rateLimitProduct = 100): Promise<void> {
+  const { OpenFoodFactsService } = await vi.importActual<
+    typeof import('@/services/openfoodfacts/openfoodfacts-service.js')
+  >('@/services/openfoodfacts/openfoodfacts-service.js');
+  vi.mocked(getOpenFoodFactsService).mockReturnValue(
+    new OpenFoodFactsService({
+      baseUrl: 'https://world.openfoodfacts.org',
+      rateLimitProduct,
+      rateLimitSearch: 100,
+      rateLimitTaxonomy: 100,
+    }),
+  );
+}
+
 describe('off_compare_products', () => {
+  const globalFetch = global.fetch;
   let ctx: ReturnType<typeof createToolContext>;
 
   beforeEach(() => {
@@ -45,6 +83,10 @@ describe('off_compare_products', () => {
       getProductFields: mockGetProductFields,
     } as never);
     ctx = createToolContext();
+  });
+
+  afterEach(() => {
+    global.fetch = globalFetch;
   });
 
   it('returns comparison rows for two found products', async () => {
@@ -358,6 +400,54 @@ describe('off_compare_products', () => {
     ]);
   });
 
+  it('lists a malformed product envelope in failed, never in not_found (#54)', async () => {
+    // The malformed-envelope check lives in the service's fetch path.
+    await useRealService();
+    const responses: Record<string, Response> = {
+      '1000': jsonResponse({}),
+      '1001': jsonResponse({ status: 1, status_verbose: 'product found' }),
+      '3017620422003': jsonResponse(PRODUCT_FOUND),
+      '2961836540127': jsonResponse(PRODUCT_NOT_FOUND_404, 404),
+    };
+    global.fetch = vi.fn(async (input: unknown) => {
+      const barcode = /\/api\/v2\/product\/(\d+)\.json/.exec(String(input))?.[1] ?? '';
+      const response = responses[barcode];
+      if (!response) throw new Error(`Unrouted request: ${String(input)}`);
+      return response;
+    });
+
+    vi.useFakeTimers();
+    try {
+      const pending = runToolContract(offCompareProductsTool, {
+        barcodes: ['1000', '1001', '3017620422003', '2961836540127'],
+      });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(result.isError).toBeFalsy();
+      const output = result.structuredContent as {
+        products: { barcode: string; found: boolean }[];
+        not_found: string[];
+        failed?: { barcode: string; reason: string; error: string }[];
+      };
+      expect(output.not_found).toEqual(['2961836540127']);
+      expect(output.failed?.map((f) => [f.barcode, f.reason])).toEqual([
+        ['1000', 'upstream_error'],
+        ['1001', 'upstream_error'],
+      ]);
+      expect(output.failed?.[0]?.error).toContain('malformed');
+      expect(output.products.map((p) => [p.barcode, p.found])).toEqual([
+        ['3017620422003', true],
+        ['2961836540127', false],
+      ]);
+      const text = contractText(result);
+      expect(text).toContain('**Not found:** 2961836540127');
+      expect(text).toMatch(/Fetch failed[\s\S]*1000[\s\S]*1001/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('omits failed entirely when every fetch completes', async () => {
     mockGetProductFields
       .mockResolvedValueOnce({ product_name: 'Found', nutriments: {} })
@@ -500,7 +590,7 @@ describe('off_compare_products', () => {
     );
 
     expect(text).toContain('### Scores');
-    expect(text).toContain('### Nutrition per 100g');
+    expect(text).toContain('### Nutrition per 100 g / 100 ml');
     expect(text).toContain('Low completeness (< 50%)');
     expect(text).toContain('**Not found:** 00000000000001');
     expect(text).toContain('not checked, not confirmed missing');
@@ -712,5 +802,334 @@ describe('off_compare_products', () => {
         expect(description).not.toMatch(/EAN-13 or UPC|8–14/);
       }
     });
+  });
+
+  // ── #57: barcodes past the 10th distinct one are listed, not fetched ─────
+
+  describe('batches above the 10-barcode cap (#57)', () => {
+    /** `count` distinct 13-digit barcodes, in order. */
+    function barcodes(count: number): string[] {
+      return Array.from({ length: count }, (_, i) => String(3_000_000_000_001 + i));
+    }
+
+    type CompareOutput = {
+      products: { barcode: string; found: boolean }[];
+      succeeded: number;
+      not_found: string[];
+      failed?: { barcode: string }[];
+      unprocessed?: string[];
+    };
+
+    it('accepts up to 100 barcodes and rejects 101 before any fetch', async () => {
+      expect(offCompareProductsTool.input.safeParse({ barcodes: barcodes(100) }).success).toBe(
+        true,
+      );
+      const result = await runToolContract(offCompareProductsTool, { barcodes: barcodes(101) });
+      expect(result.isError).toBe(true);
+      expect(mockGetProductFields).not.toHaveBeenCalled();
+    });
+
+    it('fetches the first 10 of 11 barcodes and lists the 11th as unprocessed on both surfaces', async () => {
+      mockGetProductFields.mockResolvedValue({ product_name: 'Found', nutriments: {} });
+      const input = barcodes(11);
+
+      const result = await runToolContract(offCompareProductsTool, { barcodes: input });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockGetProductFields.mock.calls.map((call) => call[0])).toEqual(input.slice(0, 10));
+      const output = result.structuredContent as CompareOutput;
+      expect(output.unprocessed).toEqual([input[10]]);
+      expect(output.products).toHaveLength(10);
+      expect(output.succeeded).toBe(10);
+      const text = contractText(result);
+      expect(text).toContain('## Product Comparison (10/10 found)');
+      expect(text).toContain(
+        `**Not compared (over the 10-barcode cap):** ${input[10]} — look it up with off_get_product, or compare it with barcodes from this call in another off_compare_products call.`,
+      );
+    });
+
+    it('names a follow-up compare call when several barcodes go unprocessed', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [{ barcode: '1111111111111', product_name: 'Found', found: true }],
+          succeeded: 1,
+          not_found: [],
+          unprocessed: ['3000000000011', '3000000000012'],
+        }),
+      );
+
+      expect(text).toContain(
+        '**Not compared (over the 10-barcode cap):** 3000000000011, 3000000000012 — compare them in another off_compare_products call, up to 10 barcodes at a time.',
+      );
+    });
+
+    it('adds no unprocessed key for a batch of exactly 10', async () => {
+      mockGetProductFields.mockResolvedValue({ product_name: 'Found', nutriments: {} });
+
+      const result = await runToolContract(offCompareProductsTool, { barcodes: barcodes(10) });
+
+      expect(mockGetProductFields).toHaveBeenCalledTimes(10);
+      expect(result.structuredContent).not.toHaveProperty('unprocessed');
+      expect(contractText(result)).not.toContain('Not compared');
+    });
+
+    it('fetches a repeated barcode once, in one row, as the description says', async () => {
+      mockGetProductFields.mockResolvedValue({ product_name: 'Found', nutriments: {} });
+      const [a, b] = barcodes(2) as [string, string];
+
+      const result = await runToolContract(offCompareProductsTool, { barcodes: [a, b, a] });
+
+      expect(mockGetProductFields.mock.calls.map((call) => call[0])).toEqual([a, b]);
+      const output = result.structuredContent as CompareOutput;
+      expect(output.products.map((p) => p.barcode)).toEqual([a, b]);
+      expect(output).not.toHaveProperty('unprocessed');
+      expect(contractText(result)).toContain('## Product Comparison (2/2 found)');
+      expect(offCompareProductsTool.description).toContain('two identical barcodes yield one row');
+      expect(offCompareProductsTool.input.shape.barcodes.description).toContain(
+        'two identical barcodes yield one row',
+      );
+    });
+
+    it('keeps every distinct barcode in exactly one bucket when a repeat and the cap meet', async () => {
+      // 12 entries, 11 distinct: the repeat takes no second slot, so the 10 fetched are the first
+      // 10 distinct and only the 11th distinct barcode is left over.
+      const distinct = barcodes(11);
+      const input = [distinct[0], distinct[1], distinct[0], ...distinct.slice(2)] as string[];
+      mockGetProductFields
+        .mockRejectedValueOnce(serviceUnavailable('Open Food Facts is unavailable.'))
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue({ product_name: 'Found', nutriments: {} });
+
+      const result = await runToolContract(offCompareProductsTool, { barcodes: input });
+
+      expect(mockGetProductFields.mock.calls.map((call) => call[0])).toEqual(distinct.slice(0, 10));
+      const output = result.structuredContent as CompareOutput;
+      expect(output.failed?.map((f) => f.barcode)).toEqual([distinct[0]]);
+      expect(output.not_found).toEqual([distinct[1]]);
+      expect(output.unprocessed).toEqual([distinct[10]]);
+      expect(
+        output.products.length + (output.failed?.length ?? 0) + (output.unprocessed?.length ?? 0),
+      ).toBe(distinct.length);
+      const buckets = [
+        ...output.products.map((p) => p.barcode),
+        ...(output.failed ?? []).map((f) => f.barcode),
+        ...(output.unprocessed ?? []),
+      ];
+      expect(new Set(buckets).size).toBe(buckets.length);
+      // The header counts the 10 compared — 8 found, 1 not found, 1 failed — never the unprocessed.
+      expect(contractText(result)).toContain('## Product Comparison (8/10 found)');
+    });
+
+    it('spends no product-budget request on unprocessed barcodes', async () => {
+      // A product budget of exactly 10 per minute: an 11th fetch would be refused by the local
+      // limiter and land in failed.
+      await useRealService(10);
+      global.fetch = vi.fn(async () => jsonResponse(PRODUCT_FOUND));
+      const input = barcodes(12);
+
+      const result = await runToolContract(offCompareProductsTool, { barcodes: input });
+
+      expect(global.fetch).toHaveBeenCalledTimes(10);
+      const output = result.structuredContent as CompareOutput;
+      expect(output.failed).toBeUndefined();
+      expect(output.succeeded).toBe(10);
+      expect(output.unprocessed).toEqual(input.slice(10));
+    });
+
+    it('scopes the zero-found summary to the barcodes compared', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [
+            { barcode: '00000000000001', found: false },
+            { barcode: '00000000000002', found: false },
+          ],
+          succeeded: 0,
+          not_found: ['00000000000001', '00000000000002'],
+          unprocessed: ['00000000000003'],
+        }),
+      );
+
+      expect(text).toContain('## Product Comparison (0/2 found)');
+      expect(text).toContain('answered for every barcode compared');
+      expect(text).toContain('Not compared (over the 10-barcode cap)');
+    });
+
+    it('says what happens above the cap in the barcodes description', () => {
+      expect(offCompareProductsTool.input.shape.barcodes.description).toMatch(
+        /up to 100[^.]*unprocessed/,
+      );
+    });
+  });
+
+  // ── #51: per-100 figures are per 100 g, or per 100 ml for liquids ─────────
+
+  describe('per-100 basis (#51)', () => {
+    const BASIS = 'per 100 g, or per 100 ml for liquids';
+
+    it('states the basis on the tool description and every per-100 field description', () => {
+      const row = offCompareProductsTool.output.shape.products.element.shape;
+      expect(offCompareProductsTool.description).toContain(BASIS);
+      expect(offCompareProductsTool.description).not.toMatch(/kcal\/100 ?g/);
+      for (const key of [
+        'energy_kcal_100g',
+        'fat_100g',
+        'saturated_fat_100g',
+        'sugars_100g',
+        'salt_100g',
+        'proteins_100g',
+        'fiber_100g',
+      ] as const) {
+        expect(row[key].description, key).toContain(BASIS);
+        expect(row[key].description, key).not.toMatch(/per 100g/);
+      }
+    });
+
+    it('puts a drink and a solid under one per 100 g / 100 ml table, values unchanged', async () => {
+      mockGetProductFields
+        .mockResolvedValueOnce({
+          product_name: 'Coca-Cola Zero Sugar',
+          brands: 'Coca-Cola',
+          nutriments: { 'energy-kcal_100g': 0, salt_100g: 0.0246 },
+        })
+        .mockResolvedValueOnce({
+          product_name: 'Old Fashioned Oats',
+          brands: 'Quaker',
+          nutriments: { 'energy-kcal_100g': 375, salt_100g: 0 },
+        });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['0049000042566', '0030000010402'],
+      });
+
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]).toEqual({
+        barcode: '0049000042566',
+        product_name: 'Coca-Cola Zero Sugar',
+        brands: 'Coca-Cola',
+        found: true,
+        energy_kcal_100g: 0,
+        salt_100g: 0.0246,
+      });
+      const text = contractText(result);
+      expect(text).toContain('### Nutrition per 100 g / 100 ml');
+      expect(text).not.toMatch(/per 100g/);
+    });
+  });
+
+  // ── #56: every text row label carries the brand ───────────────────────────
+
+  describe('row labels (#56)', () => {
+    /** The table row whose first cell is `label`. */
+    function rowsStartingWith(lines: string[], label: string): string[] {
+      return lines.filter((line) => line.startsWith(`| ${label} |`));
+    }
+
+    it('labels a brand-only row "Barcode N (Brand)" in both tables and the note', async () => {
+      // 0945666605636 as Open Food Facts returns it: a brand, no product name, low completeness.
+      mockGetProductFields
+        .mockResolvedValueOnce({ brands: 'Nutella', completeness: 0.2 })
+        .mockResolvedValueOnce({
+          product_name: 'Old Fashioned Oats',
+          brands: 'Quaker',
+          completeness: 0.9,
+          nutriments: { 'energy-kcal_100g': 375 },
+        });
+
+      const result = await runToolContract(offCompareProductsTool, {
+        barcodes: ['0945666605636', '0030000010402'],
+      });
+
+      // structuredContent is unchanged: the brand rides in brands, and no name is invented.
+      const rows = (result.structuredContent as { products: Record<string, unknown>[] }).products;
+      expect(rows[0]).toEqual({
+        barcode: '0945666605636',
+        brands: 'Nutella',
+        found: true,
+        completeness: 0.2,
+      });
+      const lines = contractText(result).split('\n');
+      expect(rowsStartingWith(lines, 'Barcode 0945666605636 (Nutella)')).toHaveLength(2);
+      expect(rowsStartingWith(lines, 'Old Fashioned Oats (Quaker)')).toHaveLength(2);
+      expect(lines).toContain(
+        '*Low completeness (< 50%): Barcode 0945666605636 (Nutella) — many fields may be missing.*',
+      );
+    });
+
+    it('tells apart two rows that share a name but not a brand', () => {
+      const lines = firstText(
+        offCompareProductsTool.format!({
+          products: [
+            { barcode: '2003', product_name: 'Cola', brands: 'Brand A', found: true },
+            { barcode: '2004', product_name: 'Cola', brands: 'Brand B', found: true },
+          ],
+          succeeded: 2,
+          not_found: [],
+        }),
+      ).split('\n');
+
+      const nutritionHeader = lines.findIndex((line) => line.startsWith('| Product | Energy'));
+      const nutritionRows = lines.slice(nutritionHeader + 2, nutritionHeader + 4);
+      expect(nutritionRows[0]).toMatch(/^\| Cola \(Brand A\) \|/);
+      expect(nutritionRows[1]).toMatch(/^\| Cola \(Brand B\) \|/);
+    });
+
+    it('labels a row with neither name nor brand "Barcode N" everywhere', () => {
+      const text = firstText(
+        offCompareProductsTool.format!({
+          products: [
+            { barcode: '12345678', found: true, completeness: 0.1 },
+            { barcode: '87654321', product_name: 'Named', found: true },
+          ],
+          succeeded: 2,
+          not_found: [],
+        }),
+      );
+      const lines = text.split('\n');
+
+      expect(rowsStartingWith(lines, 'Barcode 12345678')).toHaveLength(2);
+      expect(rowsStartingWith(lines, 'Named')).toHaveLength(2);
+      expect(text).toContain('Low completeness (< 50%): Barcode 12345678 — many fields');
+      expect(text).not.toContain('Barcode 12345678 (');
+    });
+
+    // Escaped backslash-first, a pipe after backslashes keeps an odd run ahead of it and stays
+    // escaped; escaped pipe-first, the backslash escapes would pair off and leave a bare delimiter.
+    it.each([
+      ['a pipe or a newline', 'Acme | Co\nBrands', 'Acme \\| Co Brands', 'Acme | Co Brands'],
+      [
+        'a backslash before a pipe and one at its end',
+        'Acme \\| Co\\',
+        'Acme \\\\\\| Co\\\\',
+        'Acme \\\\| Co\\\\',
+      ],
+    ])(
+      'keeps a brand carrying %s inside its cell and on the note line',
+      (_label, brands, cell, note) => {
+        const output = {
+          products: [
+            { barcode: '12345678', brands, found: true, completeness: 0.1, energy_kcal_100g: 1 },
+            { barcode: '87654321', product_name: 'Plain', found: true, energy_kcal_100g: 2 },
+          ],
+          succeeded: 2,
+          not_found: [],
+        };
+        const lines = firstText(offCompareProductsTool.format!(output)).split('\n');
+        /** Cell delimiters: pipes behind an even run of backslashes, none included. */
+        const delimiters = (line: string): number =>
+          (line.match(/(?<!\\)(?:\\\\)*\|/g) ?? []).length;
+
+        for (const header of ['| Product | Barcode |', '| Product | Energy']) {
+          const at = lines.findIndex((line) => line.startsWith(header));
+          for (const row of lines.slice(at, at + 4)) {
+            expect(delimiters(row)).toBe(delimiters(lines[at] as string));
+          }
+        }
+        expect(rowsStartingWith(lines, `Barcode 12345678 (${cell})`)).toHaveLength(2);
+        expect(lines).toContain(
+          `*Low completeness (< 50%): Barcode 12345678 (${note}) — many fields may be missing.*`,
+        );
+        expect(output.products[0]?.brands).toBe(brands);
+      },
+    );
   });
 });

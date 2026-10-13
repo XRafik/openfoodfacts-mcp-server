@@ -17,6 +17,20 @@ import { mdInline, mdTableCell } from '@/utils/markdown.js';
 const COMPARE_FIELDS =
   'product_name,brands,nutriscore_grade,nova_group,ecoscore_grade,nutriments,completeness';
 
+/**
+ * Most distinct barcodes one call fetches. More, up to the input's hard ceiling, are listed in
+ * `unprocessed` without being fetched, so one compare never spends more of the per-minute product
+ * budget than this.
+ */
+const COMPARE_BARCODE_CAP = 10;
+
+/** The next step for barcodes left unprocessed, sized to the 2-barcode minimum of a compare. */
+function unprocessedNextStep(count: number): string {
+  return count === 1
+    ? 'look it up with off_get_product, or compare it with barcodes from this call in another off_compare_products call.'
+    : `compare them in another off_compare_products call, up to ${COMPARE_BARCODE_CAP} barcodes at a time.`;
+}
+
 type CompareRow = {
   barcode: string;
   product_name?: string;
@@ -113,9 +127,23 @@ function zeroFoundSummary(notFound: string[], failed: readonly { reason: string 
   }
 
   return (
-    'Open Food Facts answered for every barcode and holds no contributor record for any of them. ' +
+    'Open Food Facts answered for every barcode compared and holds no contributor record for any of them. ' +
     'The products may exist without being entered yet — check the digits, or find them by name with off_search_products.'
   );
+}
+
+/**
+ * A row's text label: `name (brand)`, else `Barcode N (brand)`, else `Barcode N`. Names and brands
+ * are contributor-edited, so each is escaped for the context the label lands in — a table cell or
+ * an inline note. One helper for every label keeps a brand-only row, or two same-name rows, from
+ * reading differently from one table to the next.
+ */
+function rowLabel(
+  row: { barcode: string; product_name?: string | undefined; brands?: string | undefined },
+  escapeFor: (value: string) => string,
+): string {
+  const label = row.product_name ? escapeFor(row.product_name) : `Barcode ${row.barcode}`;
+  return row.brands ? `${label} (${escapeFor(row.brands)})` : label;
 }
 
 /** Build a comparison row from a raw product. */
@@ -155,7 +183,7 @@ function buildCompareRow(barcode: string, raw: RawProduct | null): CompareRow {
 export const offCompareProductsTool = tool('off_compare_products', {
   title: 'Compare Food Products Side-by-Side',
   description:
-    'Side-by-side nutrition and scoring comparison for 2–10 products by barcode. Returns a normalized table of energy (kcal/100g), fat, saturated fat, sugars, salt, protein, fiber, Nutri-Score, NOVA group, and Green-Score. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Side-by-side nutrition and scoring comparison for 2–10 products per call by barcode; a repeated barcode is compared once, so two identical barcodes yield one row, and barcodes past the 10th distinct one are listed in unprocessed rather than fetched. Returns a normalized table of energy (kcal), fat, saturated fat, sugars, salt, protein, and fiber per 100 g, or per 100 ml for liquids, plus Nutri-Score, NOVA group, and Green-Score. Designed for "which of these cereals is healthiest?" or "compare these pasta brands" workflows. Missing nutrition data for any product is preserved as absent — comparisons are not imputed. A batch is not all-or-nothing: barcodes that resolve are returned even when others fail, with confirmed-missing barcodes listed in not_found and failed fetches listed separately in failed. Scores carry regional formula caveats. Data under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -167,9 +195,9 @@ export const offCompareProductsTool = tool('off_compare_products', {
           .describe('Product barcode, digits only: 4–40 digits after any leading zeros.'),
       )
       .min(2)
-      .max(10)
+      .max(100)
       .describe(
-        '2–10 barcodes to compare, returned as one row each in input order. Example: ["3017620422003", "7622210100146"].',
+        `Barcodes to compare, returned as one row each in input order; a repeated barcode is compared once, so two identical barcodes yield one row. One call compares at most ${COMPARE_BARCODE_CAP} distinct barcodes: up to 100 are accepted, and those past the ${COMPARE_BARCODE_CAP}th distinct one are returned in unprocessed without being fetched. Example: ["3017620422003", "7622210100146"].`,
       ),
   }),
 
@@ -207,31 +235,45 @@ export const offCompareProductsTool = tool('off_compare_products', {
             energy_kcal_100g: z
               .number()
               .optional()
-              .describe('Energy per 100g in kcal. Absent when not entered.'),
+              .describe(
+                'Energy in kcal per 100 g, or per 100 ml for liquids. Absent when not entered.',
+              ),
             fat_100g: z
               .number()
               .optional()
-              .describe('Total fat per 100g in grams. Absent when not entered.'),
+              .describe(
+                'Total fat in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
+              ),
             saturated_fat_100g: z
               .number()
               .optional()
-              .describe('Saturated fat per 100g in grams. Absent when not entered.'),
+              .describe(
+                'Saturated fat in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
+              ),
             sugars_100g: z
               .number()
               .optional()
-              .describe('Total sugars per 100g in grams. Absent when not entered.'),
+              .describe(
+                'Total sugars in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
+              ),
             salt_100g: z
               .number()
               .optional()
-              .describe('Salt per 100g in grams. Absent when not entered.'),
+              .describe(
+                'Salt in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
+              ),
             proteins_100g: z
               .number()
               .optional()
-              .describe('Protein per 100g in grams. Absent when not entered.'),
+              .describe(
+                'Protein in grams per 100 g, or per 100 ml for liquids. Absent when not entered.',
+              ),
             fiber_100g: z
               .number()
               .optional()
-              .describe('Dietary fiber per 100g in grams. Often absent.'),
+              .describe(
+                'Dietary fiber in grams per 100 g, or per 100 ml for liquids. Often absent.',
+              ),
             completeness: z
               .number()
               .optional()
@@ -240,7 +282,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
           .describe('A single product comparison row.'),
       )
       .describe(
-        'Comparison rows in input order — one per barcode whose fetch completed, whether or not a record exists. Barcodes whose fetch failed have no row here; they appear in failed.',
+        'Comparison rows in input order — one per distinct barcode whose fetch completed, whether or not a record exists. Barcodes whose fetch failed have no row here; they appear in failed. Barcodes past the cap appear in unprocessed.',
       ),
     succeeded: z.number().describe('Number of barcodes that resolved to a found product.'),
     not_found: z
@@ -266,13 +308,19 @@ export const offCompareProductsTool = tool('off_compare_products', {
       .describe(
         'Barcodes whose fetch failed, with the per-barcode reason. Absent when every fetch completed. A barcode listed here is unknown, not absent from Open Food Facts — retry it with off_get_product before concluding anything about the product.',
       ),
+    unprocessed: z
+      .array(z.string().describe('Barcode left unprocessed, as provided in input.'))
+      .optional()
+      .describe(
+        `Distinct barcodes past the ${COMPARE_BARCODE_CAP}th, in input order — never fetched, so nothing is known about them. Absent when the batch held ${COMPARE_BARCODE_CAP} or fewer distinct barcodes. Compare them in another off_compare_products call (2–${COMPARE_BARCODE_CAP} barcodes), or look a single one up with off_get_product.`,
+      ),
   }),
 
   errors: [
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, or is unreachable for a barcode — reported in that barcode's failed entry rather than failing the call",
+      when: "Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, answers 2xx with a malformed envelope, or is unreachable for a barcode — reported in that barcode's failed entry rather than failing the call",
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -310,9 +358,14 @@ export const offCompareProductsTool = tool('off_compare_products', {
   async handler(input, ctx) {
     const svc = getOpenFoodFactsService();
 
-    // Fetch all products in parallel
+    // A repeated barcode takes one slot and one fetch. Past the cap, distinct barcodes are listed
+    // rather than fetched, so the product budget is spent only on the barcodes compared.
+    const distinct = [...new Set(input.barcodes)];
+    const compared = distinct.slice(0, COMPARE_BARCODE_CAP);
+    const unprocessed = distinct.slice(COMPARE_BARCODE_CAP);
+
     const settlements = await Promise.allSettled(
-      input.barcodes.map((barcode) => svc.getProductFields(barcode, COMPARE_FIELDS, ctx)),
+      compared.map((barcode) => svc.getProductFields(barcode, COMPARE_FIELDS, ctx)),
     );
 
     const products: CompareRow[] = [];
@@ -324,8 +377,8 @@ export const offCompareProductsTool = tool('off_compare_products', {
     // barcode Open Food Facts confirmed it has no record of, so a rejection is always a failure to
     // learn anything about that barcode — reporting it as not_found would assert the opposite.
     // Failures stay per-barcode so a mixed batch keeps the rows that did resolve.
-    for (let i = 0; i < input.barcodes.length; i++) {
-      const barcode = input.barcodes[i] as string;
+    for (let i = 0; i < compared.length; i++) {
+      const barcode = compared[i] as string;
       const result = settlements[i] as PromiseSettledResult<RawProduct | null>;
 
       if (result.status === 'rejected') {
@@ -350,13 +403,20 @@ export const offCompareProductsTool = tool('off_compare_products', {
     }
 
     ctx.log.info('Product comparison completed', {
-      total: input.barcodes.length,
+      total: compared.length,
       succeeded,
       not_found: not_found.length,
       failed: failed.length,
+      unprocessed: unprocessed.length,
     });
 
-    return { products, succeeded, not_found, ...(failed.length > 0 && { failed }) };
+    return {
+      products,
+      succeeded,
+      not_found,
+      ...(failed.length > 0 && { failed }),
+      ...(unprocessed.length > 0 && { unprocessed }),
+    };
   },
 
   format: (result) => {
@@ -379,6 +439,12 @@ export const offCompareProductsTool = tool('off_compare_products', {
       lines.push('');
     }
 
+    if (result.unprocessed && result.unprocessed.length > 0) {
+      lines.push(
+        `**Not compared (over the ${COMPARE_BARCODE_CAP}-barcode cap):** ${result.unprocessed.join(', ')} — ${unprocessedNextStep(result.unprocessed.length)}\n`,
+      );
+    }
+
     const found = result.products.filter((p) => p.found);
     if (found.length === 0) {
       lines.push(zeroFoundSummary(result.not_found, result.failed ?? []));
@@ -390,11 +456,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     lines.push('| Product | Barcode | Found | Nutri-Score | NOVA | Eco-Score | Completeness |');
     lines.push('|:--------|:--------|:------|:------------|:-----|:----------|:-------------|');
     for (const p of result.products) {
-      // Product names and brands are contributor-edited: a bare pipe would add a column to this
-      // row and a line break would end it, so both are neutralized before the cell is written.
-      const name = p.product_name
-        ? `${mdTableCell(p.product_name)}${p.brands ? ` (${mdTableCell(p.brands)})` : ''}`
-        : `Barcode ${p.barcode}`;
+      const name = rowLabel(p, mdTableCell);
       // The exact scalar rides alongside the rounded percentage: 0.7875 and 0.79 both render as
       // "79%", and a text-only client has no second call that would recover the difference.
       const completeness =
@@ -409,7 +471,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     }
 
     // Nutrition table
-    lines.push('\n### Nutrition per 100g');
+    lines.push('\n### Nutrition per 100 g / 100 ml');
     lines.push(
       '| Product | Energy (kcal) | Fat (g) | Sat. Fat (g) | Sugars (g) | Salt (g) | Protein (g) | Fiber (g) |',
     );
@@ -417,8 +479,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       '|:--------|:-------------|:--------|:-------------|:-----------|:---------|:------------|:----------|',
     );
     for (const p of found) {
-      const name =
-        p.product_name === undefined ? `Barcode ${p.barcode}` : mdTableCell(p.product_name);
+      const name = rowLabel(p, mdTableCell);
       const fmt = (v: number | undefined) => (v !== undefined ? String(v) : 'N/A');
       lines.push(
         `| ${name} | ${fmt(p.energy_kcal_100g)} | ${fmt(p.fat_100g)} | ${fmt(p.saturated_fat_100g)} | ${fmt(p.sugars_100g)} | ${fmt(p.salt_100g)} | ${fmt(p.proteins_100g)} | ${fmt(p.fiber_100g)} |`,
@@ -431,7 +492,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     );
     if (lowCompleteness.length > 0) {
       lines.push(
-        `\n*Low completeness (< 50%): ${lowCompleteness.map((p) => mdInline(p.product_name ?? p.barcode)).join(', ')} — many fields may be missing.*`,
+        `\n*Low completeness (< 50%): ${lowCompleteness.map((p) => rowLabel(p, mdInline)).join(', ')} — many fields may be missing.*`,
       );
     }
 

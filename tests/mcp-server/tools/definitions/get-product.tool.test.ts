@@ -4,6 +4,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { z } from '@cyanheads/mcp-ts-core';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -61,6 +62,67 @@ function firstText(blocks: ReturnType<NonNullable<typeof offGetProductTool.forma
   const block = blocks[0];
   if (block?.type !== 'text') throw new Error('Expected the formatter to return text.');
   return block.text;
+}
+
+/** The basis every per-100 figure is stated on: Open Food Facts stores liquids per 100 ml. */
+const BASIS = 'per 100 g, or per 100 ml for liquids';
+
+/**
+ * A per-100 g claim with no per-100 ml clause after it, in any spelling of the unit ("100g",
+ * "100 g", "100-g", "100 grams"). Field names such as `sugars_100g` pass.
+ */
+const BARE_PER_100_G = /(?<![_\d])100[ -]?g(?:rams?)?\b(?!, or per 100 ml for liquids)/i;
+
+/** The named per-100 output fields. */
+const NAMED_PER_100_KEYS = [
+  'energy_kcal_100g',
+  'fat_100g',
+  'saturated_fat_100g',
+  'carbohydrates_100g',
+  'sugars_100g',
+  'fiber_100g',
+  'proteins_100g',
+  'salt_100g',
+  'sodium_100g',
+] as const;
+
+/** A node of the advertised JSON Schema, narrowed to what these tests read. */
+type SchemaNode = {
+  description?: string;
+  properties?: Record<string, SchemaNode>;
+  additionalProperties?: SchemaNode;
+};
+
+/** Every description string in a schema as it is advertised to clients. */
+function schemaDescriptions(schema: z.ZodType): string[] {
+  const found: string[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+    } else if (node !== null && typeof node === 'object') {
+      for (const [key, value] of Object.entries(node)) {
+        if (key === 'description' && typeof value === 'string') found.push(value);
+        else walk(value);
+      }
+    }
+  };
+  walk(z.toJSONSchema(schema));
+  return found;
+}
+
+/** The advertised `product.nutriments` schema. */
+function nutrimentsSchema(): SchemaNode {
+  const root = z.toJSONSchema(offGetProductTool.output) as SchemaNode;
+  const nutriments = root.properties?.product?.properties?.nutriments;
+  if (!nutriments) throw new Error('Expected product.nutriments in the output schema.');
+  return nutriments;
+}
+
+/** Concatenates every text block of a `runToolContract` result — format() output plus trailer. */
+function contractText(result: { content?: { type: string; text?: string }[] }): string {
+  return (result.content ?? [])
+    .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
+    .join('\n');
 }
 
 /** Capture an expected handler rejection without widening it with the success type. */
@@ -807,7 +869,7 @@ describe('off_get_product', () => {
 
   // ── #17: nutriment coverage beyond the named subset ───────────────────────
 
-  it('surfaces nutrients outside the named subset with their upstream units', async () => {
+  it('surfaces nutrients outside the named subset with their normalized units', async () => {
     // #17 regression: everything outside the fixed 12-key map used to be dropped from both output
     // surfaces. Keys and units mirror barcode 0028400157827 as the live API returns them.
     mockGetProduct.mockResolvedValue({
@@ -839,7 +901,7 @@ describe('off_get_product', () => {
     expect(additional?.vitamin_a).toEqual({ value: 0.0001071, unit: 'g' });
     // folates and the raw kJ energy figure are dropped by the fixed map and by #17's own table.
     expect(additional?.folates).toEqual({ value: 0.000086, unit: 'g' });
-    // Units are carried, never assumed to be grams — this one is kilojoules.
+    // Not every nutrient is in grams — energy is kilojoules.
     expect(additional?.energy).toEqual({ value: 2389, unit: 'kJ' });
   });
 
@@ -910,9 +972,9 @@ describe('off_get_product', () => {
     expect(n?.additional_serving).not.toHaveProperty('sugars');
   });
 
-  it('omits the unit when upstream records none', async () => {
+  it('labels a nutrient that has no _unit sibling with its normalized unit', async () => {
     // Live-verified on barcode 3017620422003: the fruits-vegetables estimates have no _unit
-    // sibling, and nova-group's is an empty string.
+    // sibling. Their figure is a percentage, so the unit comes from the nutrient, not the sibling.
     mockGetProduct.mockResolvedValue({
       product_name: 'Unitless Test',
       nutriments: { 'fruits-vegetables-nuts-estimate-from-ingredients_100g': 13 },
@@ -922,8 +984,7 @@ describe('off_get_product', () => {
     const entry =
       result.product?.nutriments?.additional_100g?.fruits_vegetables_nuts_estimate_from_ingredients;
 
-    expect(entry).toEqual({ value: 13 });
-    expect(entry).not.toHaveProperty('unit');
+    expect(entry).toEqual({ value: 13, unit: '%' });
   });
 
   it('format() renders the additional nutrients on both per-100g and per-serving', () => {
@@ -1465,6 +1526,356 @@ describe('off_get_product', () => {
       expect(shape.barcode?.description).toContain('4–40 digits');
       expect(shape.barcode?.description).not.toMatch(/EAN-13 or UPC|8–14/);
       expect(offGetProductTool.description).not.toMatch(/EAN-13 or UPC/);
+    });
+  });
+
+  // ── #51: per-100 figures are per 100 g, or per 100 ml for liquids ─────────
+
+  describe('per-100 basis (#51)', () => {
+    /** Coca-Cola Zero Sugar (0049000042566) as Open Food Facts returns it: per-100 ml figures. */
+    const COKE_ZERO: RawProduct = {
+      product_name: 'Coca-Cola Zero Sugar',
+      nutriments: {
+        'energy-kcal_100g': 0,
+        sodium_100g: 0.00986,
+        sodium_serving: 0.035,
+        sodium_unit: 'g',
+      },
+      serving_size: '1 can (12 fl oz)',
+      serving_quantity: 354.882,
+      serving_quantity_unit: 'ml',
+    };
+
+    it('states the basis on the tool description and every per-100 field description', () => {
+      const nutriments = nutrimentsSchema();
+      expect(offGetProductTool.description).toContain(BASIS);
+      for (const key of NAMED_PER_100_KEYS) {
+        expect(nutriments.properties?.[key]?.description, key).toContain(BASIS);
+      }
+      const additional = nutriments.properties?.additional_100g;
+      expect(additional?.description).toContain(BASIS);
+      expect(additional?.additionalProperties?.properties?.value?.description).toContain(BASIS);
+    });
+
+    it('flags every spelling of a bare per-100 g claim, and only those', () => {
+      for (const bare of [
+        'per 100g',
+        'per 100 g',
+        'per 100-g',
+        'per-100 g',
+        'per 100 grams',
+        'per 100 gram',
+        'per 100 Grams',
+      ]) {
+        expect(bare).toMatch(BARE_PER_100_G);
+      }
+      for (const qualified of [
+        BASIS,
+        'per 100 grams, or per 100 ml for liquids',
+        'sugars_100g',
+        '1100 g',
+        '100 ml',
+      ]) {
+        expect(qualified).not.toMatch(BARE_PER_100_G);
+      }
+    });
+
+    it('never claims per 100 g alone in any advertised description', () => {
+      for (const text of [
+        offGetProductTool.description,
+        ...schemaDescriptions(offGetProductTool.input),
+        ...schemaDescriptions(offGetProductTool.output),
+      ]) {
+        expect(text).not.toMatch(BARE_PER_100_G);
+      }
+    });
+
+    it('renders a drink under the per 100 g / 100 ml heading, values unchanged, on both surfaces', async () => {
+      mockGetProductFields.mockResolvedValue(COKE_ZERO);
+
+      const result = await runToolContract(offGetProductTool, {
+        barcode: '0049000042566',
+        fields: ['product_name', 'nutriments'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const product = (result.structuredContent as { product: Record<string, unknown> }).product;
+      // No basis is asserted per row: the named fields keep their names and figures, and nothing
+      // beside them claims which of the two bases a figure is on.
+      expect(product.nutriments).toEqual({
+        energy_kcal_100g: 0,
+        sodium_100g: 0.00986,
+        additional_serving: { sodium: { value: 0.035, unit: 'g' } },
+      });
+      expect(Object.keys(product).sort()).toEqual(
+        [
+          'nutriments',
+          'product_name',
+          'serving_quantity',
+          'serving_quantity_unit',
+          'serving_size',
+        ].sort(),
+      );
+      const text = contractText(result);
+      expect(text).toContain('### Nutrition per 100 g / 100 ml');
+      expect(text).toContain('**Sodium:** 0.00986g');
+      expect(text).not.toMatch(/per 100g/);
+      // The per-serving heading still names the printed serving size.
+      expect(text).toContain('### Nutrition per serving (per 1 can (12 fl oz))');
+    });
+
+    it('labels the open per-100 map with the same basis', () => {
+      const text = firstText(
+        offGetProductTool.format!({
+          barcode: '0028400157827',
+          product: { nutriments: { additional_100g: { calcium: { value: 0.071, unit: 'g' } } } },
+        }),
+      );
+
+      expect(text).toContain('### Nutrition per 100 g / 100 ml');
+      expect(text).toContain('**Other nutrients per 100 g / 100 ml:**');
+      expect(text).not.toMatch(/per 100g/);
+    });
+
+    it('renders no per-100 heading for a record with only per-serving values', () => {
+      const text = firstText(
+        offGetProductTool.format!({
+          barcode: '0028400157827',
+          product: {
+            nutriments: {
+              energy_kcal_serving: 160,
+              additional_serving: { calcium: { value: 0.0199, unit: 'g' } },
+            },
+            serving_size: '28 g',
+          },
+        }),
+      );
+
+      expect(text).not.toMatch(/Nutrition per 100/);
+      expect(text).toContain('### Nutrition per serving (per 28 g)');
+      expect(text).toContain('**Energy:** 160 kcal');
+      expect(text).toContain('calcium: 0.0199 g');
+    });
+  });
+
+  // ── #52: open-map units are the nutrient's normalized unit ────────────────
+
+  describe('open-map units (#52)', () => {
+    it('labels a gram figure entered in mg as grams, in both maps and on both surfaces', async () => {
+      // The validator's loopback fixture 1001: calcium entered as 120 mg is stored as 0.12, which
+      // the entry unit labelled "0.12 mg" — a figure 1,000× too low.
+      mockGetProduct.mockResolvedValue({
+        nutriments: { calcium_100g: 0.12, calcium_serving: 0.12, calcium_unit: 'mg' },
+      });
+
+      const result = await runToolContract(offGetProductTool, { barcode: '1001' });
+
+      const nutriments = (
+        result.structuredContent as {
+          product: { nutriments: { additional_100g: object; additional_serving: object } };
+        }
+      ).product.nutriments;
+      expect(nutriments.additional_100g).toEqual({ calcium: { value: 0.12, unit: 'g' } });
+      expect(nutriments.additional_serving).toEqual({ calcium: { value: 0.12, unit: 'g' } });
+      const text = contractText(result);
+      expect(text).toContain('calcium: 0.12 g');
+      expect(text).not.toContain('0.12 mg');
+    });
+
+    it('reads energy_100g as kJ beside a legacy energy_unit of kcal', async () => {
+      // The documented legacy shape: energy entered in kcal, normalized to kJ under energy_100g.
+      mockGetProduct.mockResolvedValue({
+        nutriments: {
+          energy: 418,
+          energy_value: 100,
+          energy_unit: 'kcal',
+          energy_100g: 418,
+          'energy-kcal_100g': 100,
+          'energy-kcal_unit': 'kcal',
+        },
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '1002' }, ctx);
+
+      expect(result.product?.nutriments?.additional_100g?.energy).toEqual({
+        value: 418,
+        unit: 'kJ',
+      });
+      expect(result.product?.nutriments?.energy_kcal_100g).toBe(100);
+      expect(firstText(offGetProductTool.format!(result))).toContain('energy: 418 kJ');
+    });
+
+    /**
+     * Every row of the unit table, each given a contradicting `_unit` sibling so a unit read from
+     * it would show. The bare `energy-kcal` row is reachable only through its `_prepared` variant:
+     * `energy-kcal_100g` and `energy-kcal_serving` are both named fields.
+     */
+    it.each([
+      ['energy', 'energy', 2389, 'kJ'],
+      ['energy-kj', 'energy_kj', 2389, 'kJ'],
+      ['energy-kcal_prepared', 'energy_kcal_prepared', 68, 'kcal'],
+      ['alcohol', 'alcohol', 5.5, '% vol'],
+      ['fruits-vegetables-nuts', 'fruits_vegetables_nuts', 40, '%'],
+      [
+        'fruits-vegetables-nuts-estimate-from-ingredients',
+        'fruits_vegetables_nuts_estimate_from_ingredients',
+        13,
+        '%',
+      ],
+      [
+        'fruits-vegetables-legumes-estimate-from-ingredients',
+        'fruits_vegetables_legumes_estimate_from_ingredients',
+        0,
+        '%',
+      ],
+      ['collagen-meat-protein-ratio', 'collagen_meat_protein_ratio', 12, '%'],
+      ['cocoa', 'cocoa', 32, '%'],
+      ['whole-grain', 'whole_grain', 50, '%'],
+      ['water-hardness', 'water_hardness', 1.2, 'mmol/l'],
+      ['ph', 'ph', 7.1, undefined],
+      ['glycemic-index', 'glycemic_index', 55, undefined],
+      ['calcium', 'calcium', 0.12, 'g'],
+      ['vitamin-d', 'vitamin_d', 7.3e-7, 'g'],
+      ['trans-fat', 'trans_fat', 0, 'g'],
+      // Product Opener's unit_to_g turns kcal into kJ, so energy-from-fat is stored in kJ.
+      ['energy-from-fat', 'energy_from_fat', 300, 'kJ'],
+      ['energy-from-fat_prepared', 'energy_from_fat_prepared', 300, 'kJ'],
+      // default_unit_for_nid reads "%" from the nutrients taxonomy for these.
+      ['crude-ash', 'crude_ash', 7, '%'],
+      ['crude-fat', 'crude_fat', 12, '%'],
+      ['crude-fibre', 'crude_fibre', 3, '%'],
+      ['crude-protein', 'crude_protein', 25, '%'],
+      ['moisture', 'moisture', 10, '%'],
+    ] as const)(
+      'labels %s in its normalized unit, never the entry unit',
+      async (raw, key, value, unit) => {
+        mockGetProduct.mockResolvedValue({
+          nutriments: {
+            [`${raw}_100g`]: value,
+            [`${raw}_serving`]: value,
+            [`${raw}_unit`]: 'mg',
+          },
+        });
+
+        const result = await offGetProductTool.handler({ barcode: '1003' }, ctx);
+        const expected = unit === undefined ? { value } : { value, unit };
+
+        // Values pass through unscaled in both maps.
+        expect(result.product?.nutriments?.additional_100g?.[key]).toEqual(expected);
+        expect(result.product?.nutriments?.additional_serving?.[key]).toEqual(expected);
+      },
+    );
+
+    it('gives every *_prepared nutrient its base nutrient’s unit (live shape of 7613035530799)', async () => {
+      // Open Food Facts writes no _unit sibling for a _prepared nutrient, so every one of the
+      // 18 on this record was unitless — 68 beside 287 with nothing saying kcal and kJ.
+      mockGetProductFields.mockResolvedValue({
+        product_name: 'NESQUIK Moins de Sucres',
+        nutriments: {
+          'energy-kcal_prepared_100g': 68,
+          'energy-kj_prepared_100g': 287,
+          energy_prepared_100g: 287,
+          calcium_prepared_100g: 0.12,
+          'vitamin-d_prepared_100g': 7.3e-7,
+          'energy-kcal_prepared_serving': 143,
+          calcium_prepared_serving: 0.252,
+        },
+        serving_size: '210 g (portion)',
+        serving_quantity: 210,
+        serving_quantity_unit: 'g',
+      });
+
+      const result = await runToolContract(offGetProductTool, {
+        barcode: '7613035530799',
+        fields: ['product_name', 'nutriments'],
+      });
+
+      const nutriments = (
+        result.structuredContent as {
+          product: { nutriments: { additional_100g: object; additional_serving: object } };
+        }
+      ).product.nutriments;
+      expect(nutriments.additional_100g).toEqual({
+        energy_kcal_prepared: { value: 68, unit: 'kcal' },
+        energy_kj_prepared: { value: 287, unit: 'kJ' },
+        energy_prepared: { value: 287, unit: 'kJ' },
+        calcium_prepared: { value: 0.12, unit: 'g' },
+        vitamin_d_prepared: { value: 7.3e-7, unit: 'g' },
+      });
+      expect(nutriments.additional_serving).toEqual({
+        energy_kcal_prepared: { value: 143, unit: 'kcal' },
+        calcium_prepared: { value: 0.252, unit: 'g' },
+      });
+      const text = contractText(result);
+      expect(text).toContain('energy\\_kcal\\_prepared: 68 kcal');
+      expect(text).toContain('energy\\_kj\\_prepared: 287 kJ');
+      expect(text).toContain('calcium\\_prepared: 0.252 g');
+    });
+
+    it('renders pH with no unit and alcohol in % vol', () => {
+      const result = {
+        barcode: '1003',
+        product: {
+          nutriments: {
+            additional_100g: { ph: { value: 7.1 }, alcohol: { value: 5.5, unit: '% vol' } },
+          },
+        },
+      };
+      const lines = firstText(offGetProductTool.format!(result)).split('\n');
+
+      expect(lines).toContain('  - ph: 7.1');
+      expect(lines).toContain('  - alcohol: 5.5 % vol');
+    });
+
+    it('keeps the named fields and the nova-group exclusion beside the open map', async () => {
+      mockGetProduct.mockResolvedValue({
+        nova_group: 4,
+        nutriments: {
+          'energy-kcal_100g': 40,
+          'energy-kcal_unit': 'kJ',
+          fat_100g: 1,
+          fat_unit: 'mg',
+          'nova-group_100g': 4,
+          'nova-group_unit': '',
+          calcium_100g: 0.071,
+          calcium_unit: 'g',
+        },
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '1003' }, ctx);
+
+      expect(result.product?.nutriments).toEqual({
+        energy_kcal_100g: 40,
+        fat_100g: 1,
+        additional_100g: { calcium: { value: 0.071, unit: 'g' } },
+      });
+    });
+
+    it('returns no nutriments when the map holds only unit strings', async () => {
+      mockGetProduct.mockResolvedValue({
+        product_name: 'Units only',
+        nutriments: { calcium_unit: 'mg', energy_unit: 'kJ' },
+      });
+
+      const result = await offGetProductTool.handler({ barcode: '1004' }, ctx);
+
+      expect(result.product?.nutriments).toBeUndefined();
+    });
+
+    it('describes the units the open maps carry and that concentrations match across maps', () => {
+      const nutriments = nutrimentsSchema();
+      for (const map of ['additional_100g', 'additional_serving']) {
+        const unit =
+          nutriments.properties?.[map]?.additionalProperties?.properties?.unit?.description ?? '';
+        for (const term of ['"g"', '"kJ"', '"kcal"', '"% vol"', '"%"', '"mmol/l"', 'pH']) {
+          expect(unit, `${map} ${term}`).toContain(term);
+        }
+        expect(unit).not.toMatch(/records no unit/);
+      }
+      expect(nutriments.properties?.additional_100g?.description).not.toMatch(
+        /read the unit rather than assuming/,
+      );
+      expect(nutriments.properties?.additional_serving?.description).toMatch(/concentration/i);
     });
   });
 });

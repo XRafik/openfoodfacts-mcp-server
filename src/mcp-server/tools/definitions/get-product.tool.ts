@@ -40,7 +40,7 @@ function expandFields(fields: readonly string[]): string[] {
   return [...expanded];
 }
 
-/** One nutrient from the open map: the figure plus the unit Open Food Facts reported it in. */
+/** One nutrient from the open map: the figure plus the unit Open Food Facts normalized it to. */
 type NutrimentEntry = { value: number; unit?: string };
 
 type NamedNutriments = {
@@ -96,17 +96,51 @@ const NAMED_RAW_KEYS = new Set(NUTRIMENT_MAP.map(([rawKey]) => rawKey));
  */
 const NON_NUTRIMENT_BASE_KEYS = new Set(['nova-group']);
 
-/** Reads a `{base}_unit` sibling, ignoring the empty strings Open Food Facts stores for some keys. */
-function nutrimentUnit(raw: RawNutriments, base: string): string | undefined {
-  const unit = raw[`${base}_unit`];
-  return typeof unit === 'string' && unit !== '' ? unit : undefined;
+/**
+ * The unit Open Food Facts normalizes a nutrient's `_100g` and `_serving` figures to, mirroring its
+ * own normalizer. The `{base}_unit` sibling is never read: no `_prepared` or estimate key has one,
+ * and on a legacy record it holds the unit the contributor entered, so calcium entered as 120 mg is
+ * stored as 0.12 beside `calcium_unit: "mg"` and is 0.12 g. A `_prepared` variant takes its base
+ * nutrient's unit; pH and the glycemic index have none. One departure from Open Food Facts' own
+ * label: it files energy-from-fat under "g", but its gram conversion turns kcal into kJ and leaves
+ * kJ as entered, so the stored figure is kilojoules.
+ */
+function normalizedUnit(base: string): string | undefined {
+  const nutrient = base.endsWith('_prepared') ? base.slice(0, -'_prepared'.length) : base;
+  switch (nutrient) {
+    case 'energy':
+    case 'energy-kj':
+    case 'energy-from-fat':
+      return 'kJ';
+    case 'energy-kcal':
+      return 'kcal';
+    case 'alcohol':
+      return '% vol';
+    case 'cocoa':
+    case 'whole-grain':
+    case 'moisture':
+    case 'crude-ash':
+    case 'crude-fat':
+    case 'crude-fibre':
+    case 'crude-protein':
+      return '%';
+    case 'water-hardness':
+      return 'mmol/l';
+    case 'ph':
+    case 'glycemic-index':
+      return;
+  }
+  return nutrient.startsWith('fruits') || nutrient.startsWith('collagen') ? '%' : 'g';
 }
+
+/** The unit every open-map entry carries, stated once for both maps. */
+const NUTRIMENT_UNIT_DESCRIPTION =
+  'Unit Open Food Facts normalizes this nutrient to: "g" for most nutrients, "kJ" for energy, energy_kj, and energy_from_fat, "kcal" for energy_kcal, "% vol" for alcohol, "%" for the fruits-vegetables, collagen, cocoa, whole-grain, moisture, and crude (ash, fat, fibre, protein) ratios, and "mmol/l" for water hardness; a _prepared entry takes its base nutrient\'s unit. Absent for the unitless pH and glycemic index.';
 
 /**
  * Collects every numeric nutrient carrying `suffix` that is not already a named field, keyed by the
- * hyphen-free base name. The per-key unit is carried rather than assumed: Open Food Facts reports
- * most nutrients in grams but not all — `energy` is kJ and `energy-kcal` is kcal on the same
- * product — so normalizing everything to "grams" would mislabel them.
+ * hyphen-free base name and labeled with its normalized unit. Values are passed through as Open
+ * Food Facts normalized them, never rescaled.
  */
 function collectAdditional(
   raw: RawNutriments,
@@ -119,7 +153,7 @@ function collectAdditional(
     }
     const base = rawKey.slice(0, -suffix.length);
     if (NON_NUTRIMENT_BASE_KEYS.has(base)) continue;
-    const unit = nutrimentUnit(raw, base);
+    const unit = normalizedUnit(base);
     result[base.replace(/-/g, '_')] = { value, ...(unit !== undefined && { unit }) };
   }
   return Object.keys(result).length > 0 ? result : undefined;
@@ -154,7 +188,7 @@ function completenessLabel(score: number): string {
 }
 
 /**
- * Render one open-map nutrient as a markdown bullet, carrying its upstream unit. Takes the Zod
+ * Render one open-map nutrient as a markdown bullet, carrying its unit. Takes the Zod
  * inferred shape (`unit?: string | undefined`) rather than `NutrimentEntry`, since `format()` is
  * typed from the output schema and the project runs `exactOptionalPropertyTypes`.
  */
@@ -305,7 +339,7 @@ function servingSizeLine(
 export const offGetProductTool = tool('off_get_product', {
   title: 'Get Food Product by Barcode',
   description:
-    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per 100g and per serving, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
+    'Fetch a packaged food product by barcode (4–40 digits: EAN-13, EAN-8, UPC, and the shorter and longer codes Open Food Facts also holds) from Open Food Facts. Returns the product name, brand, quantity, ingredients (raw text and parsed list), declared allergens, trace allergens the label warns about, additives, the product-level vegan/vegetarian/palm-oil analysis, computed scores (Nutri-Score a–e, NOVA 1–4, Green-Score), nutrition per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, countries of sale, image URL, and data completeness. Open Food Facts is a crowd-sourced database — a missing field means "not yet entered by contributors," not that the attribute is absent from the actual product. Computed scores carry regional formula caveats and are indicators, not absolute rankings. Data is under ODbL 1.0 — cite Open Food Facts in downstream use.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -435,21 +469,44 @@ export const offGetProductTool = tool('off_get_product', {
           ),
         nutriments: z
           .object({
-            energy_kcal_100g: z.number().optional().describe('Energy per 100g in kcal.'),
-            fat_100g: z.number().optional().describe('Total fat per 100g in grams.'),
-            saturated_fat_100g: z.number().optional().describe('Saturated fat per 100g in grams.'),
+            energy_kcal_100g: z
+              .number()
+              .optional()
+              .describe('Energy in kcal per 100 g, or per 100 ml for liquids.'),
+            fat_100g: z
+              .number()
+              .optional()
+              .describe('Total fat in grams per 100 g, or per 100 ml for liquids.'),
+            saturated_fat_100g: z
+              .number()
+              .optional()
+              .describe('Saturated fat in grams per 100 g, or per 100 ml for liquids.'),
             carbohydrates_100g: z
               .number()
               .optional()
-              .describe('Total carbohydrates per 100g in grams.'),
-            sugars_100g: z.number().optional().describe('Total sugars per 100g in grams.'),
+              .describe('Total carbohydrates in grams per 100 g, or per 100 ml for liquids.'),
+            sugars_100g: z
+              .number()
+              .optional()
+              .describe('Total sugars in grams per 100 g, or per 100 ml for liquids.'),
             fiber_100g: z
               .number()
               .optional()
-              .describe('Dietary fiber per 100g in grams. Often absent.'),
-            proteins_100g: z.number().optional().describe('Protein per 100g in grams.'),
-            salt_100g: z.number().optional().describe('Salt per 100g in grams.'),
-            sodium_100g: z.number().optional().describe('Sodium per 100g in grams.'),
+              .describe(
+                'Dietary fiber in grams per 100 g, or per 100 ml for liquids. Often absent.',
+              ),
+            proteins_100g: z
+              .number()
+              .optional()
+              .describe('Protein in grams per 100 g, or per 100 ml for liquids.'),
+            salt_100g: z
+              .number()
+              .optional()
+              .describe('Salt in grams per 100 g, or per 100 ml for liquids.'),
+            sodium_100g: z
+              .number()
+              .optional()
+              .describe('Sodium in grams per 100 g, or per 100 ml for liquids.'),
             energy_kcal_serving: z
               .number()
               .optional()
@@ -467,38 +524,32 @@ export const offGetProductTool = tool('off_get_product', {
                 z.string().describe('Nutrient name, hyphens normalized to underscores.'),
                 z
                   .object({
-                    value: z.number().describe('The figure Open Food Facts reported per 100g.'),
-                    unit: z
-                      .string()
-                      .optional()
+                    value: z
+                      .number()
                       .describe(
-                        'Unit the figure is expressed in ("g", "kcal", "kJ"). Absent when Open Food Facts records no unit for this nutrient.',
+                        'The figure Open Food Facts holds per 100 g, or per 100 ml for liquids.',
                       ),
+                    unit: z.string().optional().describe(NUTRIMENT_UNIT_DESCRIPTION),
                   })
                   .describe('One nutrient figure with the unit it is expressed in.'),
               )
               .optional()
               .describe(
-                'Every other per-100g nutrient Open Food Facts holds, keyed by normalized name (calcium, iron, vitamin_c, trans_fat, added_sugars, cholesterol, energy in kJ, …). Excludes the named fields above, so a nutrient appears in exactly one place. Micronutrients are usually reported in grams, so calcium 0.071 g is 71 mg — read the unit rather than assuming.',
+                'Every other nutrient Open Food Facts holds per 100 g, or per 100 ml for liquids, keyed by normalized name (calcium, iron, vitamin_c, trans_fat, added_sugars, cholesterol, energy in kJ, …). Excludes the named fields above, so a nutrient appears in exactly one place. Micronutrients are in grams, so calcium 0.071 g is 71 mg.',
               ),
             additional_serving: z
               .record(
                 z.string().describe('Nutrient name, hyphens normalized to underscores.'),
                 z
                   .object({
-                    value: z.number().describe('The figure Open Food Facts reported per serving.'),
-                    unit: z
-                      .string()
-                      .optional()
-                      .describe(
-                        'Unit the figure is expressed in ("g", "kcal", "kJ"). Absent when Open Food Facts records no unit for this nutrient.',
-                      ),
+                    value: z.number().describe('The figure Open Food Facts holds per serving.'),
+                    unit: z.string().optional().describe(NUTRIMENT_UNIT_DESCRIPTION),
                   })
                   .describe('One nutrient figure with the unit it is expressed in.'),
               )
               .optional()
               .describe(
-                'The same nutrients per serving. Also carries the per-serving figures for macros that have a named per-100g field but no named per-serving one (saturated_fat, carbohydrates, fiber, proteins, salt, sodium). Check serving_size for the denominator these figures are measured against.',
+                'The same nutrients per serving. Also carries the per-serving figures for macros that have a named _100g field but no named per-serving one (saturated_fat, carbohydrates, fiber, proteins, salt, sodium). Percent, % vol, and unitless figures are concentrations, so they equal the per-100 figure. Check serving_size for the denominator the other figures are measured against.',
               ),
           })
           .optional()
@@ -509,7 +560,7 @@ export const offGetProductTool = tool('off_get_product', {
           .string()
           .optional()
           .describe(
-            'Serving size as printed on the label (e.g. "28 g", "1 can (12 fl oz)"). The denominator for every per-serving figure. Absent when contributors have not entered one, in which case per-serving values cannot be converted to or from the per-100g values.',
+            'Serving size as printed on the label (e.g. "28 g", "1 can (12 fl oz)"). The denominator for every per-serving figure. Absent when contributors have not entered one, in which case per-serving values cannot be converted to or from the per-100 values.',
           ),
         serving_quantity: z
           .number()
@@ -588,7 +639,7 @@ export const offGetProductTool = tool('off_get_product', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, or is unreachable',
+      when: 'Open Food Facts returns a 5xx other than 501 or 504, serves an HTML error page with a 2xx or 5xx status, answers 2xx with a malformed envelope, or is unreachable',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -691,22 +742,25 @@ export const offGetProductTool = tool('off_get_product', {
     // Nutrition
     if (p.nutriments) {
       const n = p.nutriments;
-      lines.push('\n### Nutrition per 100g');
-      if (n.energy_kcal_100g !== undefined) lines.push(`**Energy:** ${n.energy_kcal_100g} kcal`);
-      if (n.fat_100g !== undefined) lines.push(`**Fat:** ${n.fat_100g}g`);
+      // Open Food Facts stores liquids per 100 ml under the same _100g keys and no field reliably
+      // says which basis a record is on, so the heading names both rather than asserting one.
+      const per100: string[] = [];
+      if (n.energy_kcal_100g !== undefined) per100.push(`**Energy:** ${n.energy_kcal_100g} kcal`);
+      if (n.fat_100g !== undefined) per100.push(`**Fat:** ${n.fat_100g}g`);
       if (n.saturated_fat_100g !== undefined)
-        lines.push(`  - Saturated fat: ${n.saturated_fat_100g}g`);
+        per100.push(`  - Saturated fat: ${n.saturated_fat_100g}g`);
       if (n.carbohydrates_100g !== undefined)
-        lines.push(`**Carbohydrates:** ${n.carbohydrates_100g}g`);
-      if (n.sugars_100g !== undefined) lines.push(`  - Sugars: ${n.sugars_100g}g`);
-      if (n.fiber_100g !== undefined) lines.push(`**Fiber:** ${n.fiber_100g}g`);
-      if (n.proteins_100g !== undefined) lines.push(`**Protein:** ${n.proteins_100g}g`);
-      if (n.salt_100g !== undefined) lines.push(`**Salt:** ${n.salt_100g}g`);
-      if (n.sodium_100g !== undefined) lines.push(`**Sodium:** ${n.sodium_100g}g`);
+        per100.push(`**Carbohydrates:** ${n.carbohydrates_100g}g`);
+      if (n.sugars_100g !== undefined) per100.push(`  - Sugars: ${n.sugars_100g}g`);
+      if (n.fiber_100g !== undefined) per100.push(`**Fiber:** ${n.fiber_100g}g`);
+      if (n.proteins_100g !== undefined) per100.push(`**Protein:** ${n.proteins_100g}g`);
+      if (n.salt_100g !== undefined) per100.push(`**Salt:** ${n.salt_100g}g`);
+      if (n.sodium_100g !== undefined) per100.push(`**Sodium:** ${n.sodium_100g}g`);
       if (n.additional_100g) {
-        lines.push('**Other nutrients per 100g:**');
-        lines.push(...additionalLines(n.additional_100g));
+        per100.push('**Other nutrients per 100 g / 100 ml:**');
+        per100.push(...additionalLines(n.additional_100g));
       }
+      if (per100.length > 0) lines.push('\n### Nutrition per 100 g / 100 ml', ...per100);
 
       if (
         n.energy_kcal_serving !== undefined ||

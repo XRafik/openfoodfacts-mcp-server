@@ -1,12 +1,13 @@
 /**
  * @fileoverview Tests for the tag-value canonicalizer the text search path runs every tag filter
  * through (GH issue #39): brand slugging, offline-sample and live-autocomplete resolution under the
- * exact-match rule, best-effort fallback, and the in-process cache. Driven through the real
- * OpenFoodFactsService with a stubbed global fetch, so the rate limiter, retry classification, and
- * option parsing on the lookup path all run.
+ * exact-match rule, best-effort fallback, the in-process cache, and caller cancellation (GH issue
+ * #60). Driven through the real OpenFoodFactsService with a stubbed global fetch, so the rate
+ * limiter, retry classification, and option parsing on the lookup path all run.
  * @module tests/services/taxonomy/taxonomy-service.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
@@ -382,6 +383,138 @@ describe('TaxonomyService.canonicalizeTag', () => {
       await taxonomy.canonicalizeTag('countries', 'place 0', ctx);
       expect(global.fetch).toHaveBeenCalledTimes(502);
     });
+  });
+});
+
+describe('TaxonomyService — caller cancellation (#60)', () => {
+  const globalFetch = global.fetch;
+  /** Resolves when the stubbed autocomplete fetch has been entered and is holding its request open. */
+  let fetchEntered: Promise<void>;
+
+  /**
+   * Stubs the autocomplete with a request that stays in flight until its signal aborts, then
+   * rejects the way a real fetch does. Calls after the first answer `options` at once, so a second
+   * caller's own lookup can complete.
+   */
+  function stubHangingThen(options: { id: string; text: string }[] = []): void {
+    let entered: () => void = () => undefined;
+    fetchEntered = new Promise((resolve) => {
+      entered = resolve;
+    });
+    let calls = 0;
+    global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+      calls += 1;
+      if (calls > 1) {
+        return Promise.resolve(mockResponse({ took: 1, timed_out: false, options }));
+      }
+      entered();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('The operation was aborted.', 'AbortError')),
+        );
+      });
+    }) as typeof fetch;
+  }
+
+  /** Starts `run`, aborts the controller once the lookup is in flight, and returns its rejection. */
+  async function abortMidFetch(
+    controller: AbortController,
+    run: () => Promise<unknown>,
+  ): Promise<unknown> {
+    const pending = run();
+    pending.catch(() => undefined);
+    await fetchEntered;
+    controller.abort();
+    return pending.then(
+      () => {
+        throw new Error('Expected the aborted call to reject.');
+      },
+      (error: unknown) => error,
+    );
+  }
+
+  afterEach(() => {
+    global.fetch = globalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('ends canonicalizeTag as cancelled, never as lookup_failed, and retries nothing', async () => {
+    const taxonomy = makeTaxonomy();
+    stubHangingThen();
+    const controller = new AbortController();
+
+    const error = await abortMidFetch(controller, () =>
+      taxonomy.canonicalizeTag(
+        'countries',
+        'Never Land',
+        createMockContext({ signal: controller.signal }),
+      ),
+    );
+
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(global.fetch).toHaveBeenCalledOnce();
+  });
+
+  it('caches nothing for a cancelled lookup, so the next caller asks the vocabulary', async () => {
+    const taxonomy = makeTaxonomy();
+    stubHangingThen([{ id: 'en:united-states', text: 'US' }]);
+    const controller = new AbortController();
+    await abortMidFetch(controller, () =>
+      taxonomy.canonicalizeTag('countries', 'US', createMockContext({ signal: controller.signal })),
+    );
+
+    await expect(taxonomy.canonicalizeTag('countries', 'US', createMockContext())).resolves.toEqual(
+      { value: 'en:united-states', resolution: 'vocabulary' },
+    );
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps one caller's cancellation from the callers sharing its lookup, replacing it once", async () => {
+    const taxonomy = makeTaxonomy();
+    stubHangingThen([{ id: 'en:united-states', text: 'US' }]);
+    const controller = new AbortController();
+    const owner = taxonomy.canonicalizeTag(
+      'countries',
+      'US',
+      createMockContext({ signal: controller.signal }),
+    );
+    owner.catch(() => undefined);
+    await fetchEntered;
+    // Each joins the lookup the first caller started, then sees it end in that caller's cancellation.
+    const joiners = Array.from({ length: 4 }, () =>
+      taxonomy.canonicalizeTag('countries', 'US', createMockContext()),
+    );
+    controller.abort();
+
+    await expect(owner).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    await expect(Promise.all(joiners)).resolves.toEqual(
+      Array.from({ length: 4 }, () => ({ value: 'en:united-states', resolution: 'vocabulary' })),
+    );
+    // The cancelled request, then one replacement shared by every caller still waiting.
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('ends search() as cancelled, never as the offline fallback', async () => {
+    const taxonomy = makeTaxonomy();
+    stubHangingThen();
+    const controller = new AbortController();
+
+    const error = await abortMidFetch(controller, () =>
+      taxonomy.search('categories', 'lentil', 20, createMockContext({ signal: controller.signal })),
+    );
+
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(global.fetch).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the offline fallback for an upstream failure that is not a cancellation', async () => {
+    const taxonomy = makeTaxonomy();
+    global.fetch = vi.fn(async () => mockResponse({ detail: 'refused' }, 400));
+
+    const result = await taxonomy.search('categories', 'cheese', 20, createMockContext());
+
+    expect(result.tags.map((tag) => tag.id)).toEqual(['en:cheeses', 'en:fresh-cheeses']);
+    expect(result.notice).toContain('could not be reached or gave no usable answer');
   });
 });
 

@@ -459,8 +459,8 @@ export type TaxonomySearchResult = {
   matched_in_facet: number;
   /**
    * Agent-facing caveat about how this answer was produced — that the vocabulary listed is the
-   * offline sample, that the live vocabulary could not be reached, or that nothing matched. Absent
-   * when the live resolution answered normally.
+   * offline sample, that the live vocabulary could not be reached or gave no usable answer, or that
+   * nothing matched. Absent when the live resolution answered normally.
    */
   notice?: string;
 };
@@ -482,9 +482,11 @@ export class TaxonomyService {
    * `en:united-states`) or singular (`en:peanut` → `en:peanuts`, `en:nut` → `en:nuts`) resolves,
    * and a prefix or partial match never does (`nutell` is not `nutella`, `US` is not `USSR`).
    *
-   * Never throws. Anything nothing confirms comes back normalized the way Product Opener would
-   * store it, with the reason. Settled answers are cached in process per facet and value, bounded
-   * at `MAX_CANONICAL_CACHE_ENTRIES`; a failed lookup is not, so the next search retries it.
+   * Throws only when the caller cancels (`ctx.signal` aborted), so a cancellation ends the call
+   * rather than reading as a failed lookup. Anything nothing confirms comes back normalized the way
+   * Product Opener would store it, with the reason. Settled answers are cached in process per facet
+   * and value, bounded at `MAX_CANONICAL_CACHE_ENTRIES`; a failed lookup is not, so the next search
+   * retries it.
    * Concurrent calls for one value share a single lookup. A live lookup spends the taxonomy
    * budget, not the search budget.
    */
@@ -509,15 +511,23 @@ export class TaxonomyService {
 
     // Concurrent calls for one value — an inclusion and an exclusion of the same allergen in one
     // search — share the lookup in flight. The entry leaves the map once the lookup settles, so a
-    // failed one is retried by the next call just as an uncached one is.
+    // failed one is retried by the next call just as an uncached one is. A shared lookup rejects
+    // only when the caller that started it was cancelled; a joiner still waiting starts over, so
+    // the first one back owns the replacement lookup and the rest join it.
     const inFlight = this.inFlightLookups.get(cacheKey);
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      return inFlight.catch((error: unknown) => {
+        if (ctx.signal.aborted) throw error;
+        if (this.inFlightLookups.get(cacheKey) === inFlight) this.inFlightLookups.delete(cacheKey);
+        return this.canonicalizeTag(facet, value, ctx);
+      });
+    }
     const lookup = this.resolveLive(facet, { trimmed, normalized, term, isMatch }, cacheKey, ctx);
     this.inFlightLookups.set(cacheKey, lookup);
     try {
       return await lookup;
     } finally {
-      this.inFlightLookups.delete(cacheKey);
+      if (this.inFlightLookups.get(cacheKey) === lookup) this.inFlightLookups.delete(cacheKey);
     }
   }
 
@@ -551,6 +561,8 @@ export class TaxonomyService {
         ctx,
       );
     } catch (error) {
+      // A caller that went away ends the call as cancelled; only an upstream failure degrades.
+      if (ctx.signal.aborted) throw error;
       ctx.log.warning(
         'Tag value could not be checked against the live vocabulary — sending it normalized',
         {
@@ -627,7 +639,8 @@ export class TaxonomyService {
      * during an Open Food Facts outage is better served by the offline match plus a caveat than by
      * a failure, and a caller whose term matches nothing offline needs to be told the vocabulary
      * went unchecked rather than reading an empty list as "no such tag". Both are the failure this
-     * degradation exists to prevent, so the throw is absorbed here and reported in `notice`.
+     * degradation exists to prevent, so the throw is absorbed here and reported in `notice` — except
+     * a caller cancellation, which ends the call: nobody is left to read a degraded answer.
      */
     let live: TaxonomyEntry[];
     try {
@@ -641,6 +654,7 @@ export class TaxonomyService {
        */
       live = await this.off.suggestTaxonomy(taxonomyName, term, MAX_AUTOCOMPLETE_SIZE, ctx);
     } catch (error) {
+      if (ctx.signal.aborted) throw error;
       const cause = error instanceof Error ? error.message : String(error);
       ctx.log.warning('Live taxonomy resolution failed — falling back to the offline sample', {
         facet,
@@ -652,7 +666,7 @@ export class TaxonomyService {
         tags: offline.slice(0, limit).map(toTag),
         matched_in_facet: offline.length,
         notice:
-          `The live Open Food Facts ${facet} vocabulary could not be reached ` +
+          `The live Open Food Facts ${facet} vocabulary could not be reached or gave no usable answer ` +
           `(${cause}). These ${offline.length} result(s) come ` +
           `from this server's offline sample of ${embedded.length} entries, so a term the sample does not ` +
           'cover reads as no match here even when the tag exists upstream. Retry for an authoritative answer.',

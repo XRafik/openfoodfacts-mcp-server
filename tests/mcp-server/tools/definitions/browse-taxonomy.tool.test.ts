@@ -2,7 +2,8 @@
  * @fileoverview Tests for off_browse_taxonomy — live taxonomy resolution against the
  * search-a-licious autocomplete endpoint, the offline-sample merge and fallback (GH issue #14),
  * bare NOVA group tag IDs (GH issue #15), exact-term ranking of live suggestions (GH issue #42),
- * and the tag output shape (GH issue #43).
+ * the tag output shape (GH issue #43), the per-call limit cap (GH issue #57), and caller
+ * cancellation (GH issue #60).
  *
  * The taxonomy service now makes an HTTP call for the five open facets, so these stub global
  * `fetch` rather than mocking `fetchWithTimeout`: the framework helper throws on a non-2xx, so a
@@ -11,7 +12,8 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -57,6 +59,13 @@ function firstText(blocks: ReturnType<NonNullable<typeof offBrowseTaxonomyTool.f
   const block = blocks[0];
   if (block?.type !== 'text') throw new Error('Expected the formatter to return text.');
   return block.text;
+}
+
+/** Concatenates every text block of a `runToolContract` result — format() output plus trailer. */
+function contractText(result: { content?: { type: string; text?: string }[] }): string {
+  return (result.content ?? [])
+    .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
+    .join('\n');
 }
 
 describe('off_browse_taxonomy', () => {
@@ -488,6 +497,37 @@ describe('off_browse_taxonomy', () => {
       expect(second.notice).toContain('could not be reached');
       expect(second.notice).toContain('budget');
     });
+
+    it('ends as cancelled, not as the offline fallback, when the caller aborts mid-lookup (#60)', async () => {
+      let entered: () => void = () => undefined;
+      const fetchEntered = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      global.fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+        entered();
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('The operation was aborted.', 'AbortError')),
+          );
+        });
+      }) as typeof fetch;
+      const controller = new AbortController();
+
+      const pending = runToolContract(
+        offBrowseTaxonomyTool,
+        { facet: 'categories', search: 'lentil' },
+        { context: { signal: controller.signal } },
+      );
+      await fetchEntered;
+      controller.abort();
+      const result = await pending;
+
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as { error: { code: number } };
+      expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(contractText(result)).not.toContain('offline sample');
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
   });
 
   // ── GH issue #15: nova_groups tag IDs round-trip into off_search_products ──
@@ -912,5 +952,170 @@ describe('off_browse_taxonomy', () => {
   it('throws when taxonomy service is not initialized', () => {
     // After beforeEach calls initTaxonomyService(), the service is initialized.
     expect(() => getTaxonomyService()).not.toThrow();
+  });
+
+  // ── #57: a limit above 100 returns the first 100 ─────────────────────────
+
+  describe('limit above the per-call cap (#57)', () => {
+    /** `count` live suggestions for "zork", a term the offline sample holds nothing for. */
+    function stubZorkMatches(count: number): void {
+      stubAutocomplete(
+        Array.from({ length: count }, (_, i) => ({ id: `en:zork-${i}`, text: `Zork ${i}` })),
+      );
+    }
+
+    /** The truncation and notice keys a complete answer must not carry. */
+    const TRUNCATION_KEYS = ['truncated', 'shown', 'cap', 'notice'] as const;
+
+    it('accepts limit 200 and rejects 201 before any lookup', async () => {
+      expect(offBrowseTaxonomyTool.input.safeParse({ facet: 'labels', limit: 200 }).success).toBe(
+        true,
+      );
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'categories',
+        search: 'zork',
+        limit: 201,
+      });
+      expect(result.isError).toBe(true);
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it('returns the first 100 of 120 matches for limit 150, naming both on both surfaces', async () => {
+      stubZorkMatches(120);
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'categories',
+        search: 'zork',
+        limit: 150,
+      });
+
+      const structured = result.structuredContent as {
+        tags: { id: string }[];
+        notice?: string;
+      } & Record<string, unknown>;
+      expect(structured.tags).toHaveLength(100);
+      expect(structured.tags[99]?.id).toBe('en:zork-99');
+      expect(structured).toMatchObject({ truncated: true, shown: 100, cap: 100 });
+      expect(structured.notice).toBe(
+        'limit 150 is above the 100 tags one call returns; the term matched 120 tags, and these are the first 100. Narrow the search term with a more specific word to bring the tag you need into the first 100 — there is no offset to page past them.',
+      );
+      // Still one lookup, at the whole pool, not sized to the limit.
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(fetchedUrl().searchParams.get('size')).toBe('200');
+      const text = contractText(result);
+      expect(text).toContain('## categories (100 entries)');
+      expect(text).toContain('limit 150 is above the 100 tags one call returns');
+    });
+
+    it.each([
+      { limit: 150, matches: 30 },
+      { limit: 20, matches: 10 },
+    ])(
+      'adds no truncation fields for limit $limit when all $matches matches fit',
+      async ({ limit, matches }) => {
+        stubZorkMatches(matches);
+
+        const result = await runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: 'zork',
+          limit,
+        });
+
+        const structured = result.structuredContent as { tags: unknown[] } & Record<
+          string,
+          unknown
+        >;
+        expect(structured.tags).toHaveLength(matches);
+        for (const key of TRUNCATION_KEYS) expect(structured).not.toHaveProperty(key);
+      },
+    );
+
+    it('points at a narrower term, not a larger limit, when the cap cuts matches at limit 100', async () => {
+      // A limit of 101–200 returns these same 100 tags, so "raise the cap" is a call that cannot
+      // bring the 101st match forward; only a narrower term can.
+      stubZorkMatches(120);
+
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'categories',
+        search: 'zork',
+        limit: 100,
+      });
+
+      const structured = result.structuredContent as { notice?: string } & Record<string, unknown>;
+      expect(structured).toMatchObject({ truncated: true, shown: 100, cap: 100 });
+      expect(structured.notice).toBe(
+        'The term matched 120 tags, and these are the first 100. Narrow the search term with a more specific word to bring the tag you need into the first 100 — there is no offset to page past them.',
+      );
+    });
+
+    it.each([
+      {
+        label: 'every match fits in a raised limit',
+        matches: 30,
+        notice:
+          'The term matched 30 tags, and these are the first 20. Raise limit to 30 to list them all, or narrow the search term with a more specific word.',
+      },
+      {
+        label: 'more matched than one call returns',
+        matches: 120,
+        notice:
+          'The term matched 120 tags, and these are the first 20. Raise limit to 100 for the first 100, or narrow the search term with a more specific word.',
+      },
+    ])(
+      'names the match count and a real next step when limit 20 cuts matches and $label',
+      async ({ matches, notice }) => {
+        // The framework default ("Raise the cap or narrow with filters") names filters this tool
+        // does not have.
+        stubZorkMatches(matches);
+
+        const result = await runToolContract(offBrowseTaxonomyTool, {
+          facet: 'categories',
+          search: 'zork',
+          limit: 20,
+        });
+
+        expect(result.structuredContent).toMatchObject({
+          truncated: true,
+          shown: 20,
+          cap: 20,
+          notice,
+        });
+        const text = contractText(result);
+        expect(text).toContain(notice);
+        expect(text).not.toContain('narrow with filters');
+      },
+    );
+
+    it('names the listing size, and no search term, when a small limit cuts a closed facet', async () => {
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'nova_groups',
+        limit: 2,
+      });
+
+      const structured = result.structuredContent as { notice?: string } & Record<string, unknown>;
+      expect(structured).toMatchObject({ truncated: true, shown: 2, cap: 2, total_in_facet: 4 });
+      expect(structured.notice).toBe(
+        'The listing holds 4 tags, and these are the first 2. Raise limit to 4 to list them all.',
+      );
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it('keeps the offline-sample caveat after the cut guidance on an unfiltered browse', async () => {
+      const result = await runToolContract(offBrowseTaxonomyTool, {
+        facet: 'categories',
+        limit: 5,
+      });
+
+      const notice = String((result.structuredContent as Record<string, unknown>).notice);
+      expect(notice).toMatch(
+        /^The listing holds \d+ tags, and these are the first 5\. Raise limit to \d+ to list them all\. This is this server's offline categories sample/,
+      );
+    });
+
+    it('says what happens above the cap in the limit description', () => {
+      expect(offBrowseTaxonomyTool.input.shape.limit.description).toMatch(
+        /up to 200[^.]*returns the first 100/,
+      );
+    });
   });
 });

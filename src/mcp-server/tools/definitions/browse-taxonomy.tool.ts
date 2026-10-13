@@ -4,8 +4,15 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { MAX_AUTOCOMPLETE_SIZE } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import { type Facet, getTaxonomyService } from '@/services/taxonomy/taxonomy-service.js';
 import { mdInline, mdInlineCode } from '@/utils/markdown.js';
+
+/**
+ * Most tags one call returns. A larger `limit`, up to the suggestions one live lookup reads
+ * (`MAX_AUTOCOMPLETE_SIZE`), returns this many and discloses the cut when more matched.
+ */
+const TAXONOMY_LIMIT_CAP = 100;
 
 export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
   title: 'Browse Food Facts Taxonomy',
@@ -41,10 +48,10 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .number()
       .int()
       .min(1)
-      .max(100)
+      .max(MAX_AUTOCOMPLETE_SIZE)
       .default(20)
       .describe(
-        'Maximum entries to return (1–100, default 20). There is no offset or page input: Open Food Facts offers no cursor for this lookup, so narrow the search term rather than paging. The tag spelling the term itself (e.g. "lentil" → en:lentils) is listed first among the live matches, so it is not the one a small limit cuts.',
+        `Maximum entries to return (default 20). One call returns at most ${TAXONOMY_LIMIT_CAP}: a larger value, up to ${MAX_AUTOCOMPLETE_SIZE} (the most suggestions one lookup reads), returns the first ${TAXONOMY_LIMIT_CAP} and, when more matched, says how many did. There is no offset or page input: Open Food Facts offers no cursor for this lookup, so narrow the search term rather than paging. The tag spelling the term itself (e.g. "lentil" → en:lentils) is listed first among the live matches, so it is not the one a small limit cuts.`,
       ),
   }),
 
@@ -77,17 +84,21 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .string()
       .optional()
       .describe(
-        'Caveat about the answer — that the listing is a limited reference list rather than the full vocabulary, that Open Food Facts was unreachable, or that nothing matched and why.',
+        `Caveat about the answer — that the listing is a limited reference list rather than the full vocabulary, that the live vocabulary could not be reached or gave no usable answer, that nothing matched and why, or that the limit cut matches, naming how many matched and the next call: a larger limit while one would list more, otherwise a narrower term, which is the only route past the first ${TAXONOMY_LIMIT_CAP} (a limit above ${TAXONOMY_LIMIT_CAP} is named too).`,
       ),
     truncated: z.boolean().optional().describe('True when more tags exist beyond the limit.'),
     shown: z.number().optional().describe('Number of tags returned.'),
-    cap: z.number().optional().describe('The limit that was applied.'),
+    cap: z
+      .number()
+      .optional()
+      .describe(`The limit that was applied — at most ${TAXONOMY_LIMIT_CAP}.`),
   },
 
   async handler(input, ctx) {
     const svc = getTaxonomyService();
+    const limit = Math.min(input.limit, TAXONOMY_LIMIT_CAP);
     // The service trims and treats a blank term as absent, so the raw input goes through as given.
-    const result = await svc.search(input.facet as Facet, input.search, input.limit, ctx);
+    const result = await svc.search(input.facet as Facet, input.search, limit, ctx);
 
     ctx.log.info('Taxonomy browsed', {
       facet: input.facet,
@@ -102,14 +113,32 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
     // pre-filter vocabulary total.
     //
     // `notice` is one slot, and ctx.enrich.truncated() writes it from `guidance`, so the service's
-    // caveat is routed through that argument when both apply rather than being emitted separately
-    // and silently overwritten. It is the more useful next move than the generic raise-the-limit
-    // default: on an unfiltered browse the answer is to pass a search term, not a larger cap.
+    // caveat follows the cut guidance in that argument rather than being emitted separately and
+    // silently overwritten: on an unfiltered browse it says to pass a search term.
+    //
+    // The cut guidance names the match count and a call that can bring more forward. Below the
+    // cap that is a larger limit, or a narrower term when there is one. At the cap a larger limit
+    // returns these same tags, so only a narrower term reaches the rest; a limit above the cap is
+    // named too, since it is no longer what the cut was measured against. With every match
+    // returned, nothing was withheld and nothing is disclosed. The cap branch can say "the term":
+    // every embedded sample is smaller than the cap, so only a live search term reaches it.
     if (result.tags.length < result.matched_in_facet) {
+      const matched = result.matched_in_facet;
+      let cut: string;
+      if (limit === TAXONOMY_LIMIT_CAP) {
+        cut = `${limit < input.limit ? `limit ${input.limit} is above the ${TAXONOMY_LIMIT_CAP} tags one call returns; the` : 'The'} term matched ${matched} tags, and these are the first ${TAXONOMY_LIMIT_CAP}. Narrow the search term with a more specific word to bring the tag you need into the first ${TAXONOMY_LIMIT_CAP} — there is no offset to page past them.`;
+      } else {
+        const hasTerm = Boolean(input.search?.trim());
+        const raise =
+          matched <= TAXONOMY_LIMIT_CAP
+            ? `Raise limit to ${matched} to list them all`
+            : `Raise limit to ${TAXONOMY_LIMIT_CAP} for the first ${TAXONOMY_LIMIT_CAP}`;
+        cut = `${hasTerm ? 'The term matched' : 'The listing holds'} ${matched} tags, and these are the first ${limit}. ${raise}${hasTerm ? ', or narrow the search term with a more specific word' : ''}.`;
+      }
       ctx.enrich.truncated({
         shown: result.tags.length,
-        cap: input.limit,
-        ...(result.notice && { guidance: result.notice }),
+        cap: limit,
+        guidance: [cut, result.notice].filter(Boolean).join(' '),
       });
     } else if (result.notice) {
       ctx.enrich.notice(result.notice);

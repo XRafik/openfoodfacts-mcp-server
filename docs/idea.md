@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server — Idea & Requirements
 
-Barcode-to-label for 3M+ food products worldwide via Open Food Facts — ingredients, allergens, additives, Nutri-Score, NOVA processing class, and per-100g nutrition.
+Barcode-to-label for 3M+ food products worldwide via Open Food Facts — ingredients, allergens, additives, Nutri-Score, NOVA processing class, and nutrition per 100 g, or per 100 ml for liquids.
 
 | | |
 |---|---|
@@ -14,7 +14,7 @@ Barcode-to-label for 3M+ food products worldwide via Open Food Facts — ingredi
 
 ## Overview
 
-Global packaged-food database via [Open Food Facts](https://world.openfoodfacts.org) — barcode lookup for 3M+ products with ingredients, allergens, additives, Nutri-Score, NOVA processing class, Green-Score, and per-100g nutrition. Free, open data (ODbL), no key; the API only asks for an identifying User-Agent.
+Global packaged-food database via [Open Food Facts](https://world.openfoodfacts.org) — barcode lookup for 3M+ products with ingredients, allergens, additives, Nutri-Score, NOVA processing class, Green-Score, and nutrition per 100 g, or per 100 ml for liquids. Free, open data (ODbL), no key; the API only asks for an identifying User-Agent.
 
 Complements `usda-mcp-server` (US FoodData Central — generic, US-centric foods): Open Food Facts is the global, barcode-addressable, branded-product side. Enter a barcode anywhere in the world and get the label back. Crowd-sourced, so completeness varies by region and product — but it's the largest open product database that exists.
 
@@ -41,13 +41,13 @@ Open Food Facts API v2, keyless. Barcode (EAN-13 / UPC) is the primary key; fiel
 | `/api/v2/product/{barcode}?fields=…` | Field-scoped reads | Keep payloads small |
 | Taxonomy (`/categories.json`, `/labels.json`, …) | Facet / tag vocabularies | Resolve human terms to canonical tag IDs |
 
-Key fields: `product_name`, `brands`, `quantity`, `ingredients_text` + parsed `ingredients[]`, `allergens_tags`, `additives_tags`, `nutriscore_grade`, `nova_group` (1–4), `ecoscore_grade` / `environmental_score`, `nutriments` (per 100g + per serving), `categories_tags`, `labels_tags`, `packaging`, `origins`, `image_url`.
+Key fields: `product_name`, `brands`, `quantity`, `ingredients_text` + parsed `ingredients[]`, `allergens_tags`, `additives_tags`, `nutriscore_grade`, `nova_group` (1–4), `ecoscore_grade` / `environmental_score`, `nutriments` (per serving, and per 100 g, or per 100 ml for liquids), `categories_tags`, `labels_tags`, `packaging`, `origins`, `image_url`.
 
 ## Tool Surface (planned)
 
 | Tool | Behavior |
 |:---|:---|
-| `off_get_product` | **Primary.** Product by barcode (EAN/UPC): name, brands, quantity, ingredients (raw + parsed), allergens, additives, Nutri-Score, NOVA group, Green-Score, nutriments per 100g and per serving, categories, labels, packaging, origins, image URL. Field selection to trim the object. |
+| `off_get_product` | **Primary.** Product by barcode (EAN/UPC): name, brands, quantity, ingredients (raw + parsed), allergens, additives, Nutri-Score, NOVA group, Green-Score, nutriments per serving and per 100 g, or per 100 ml for liquids, categories, labels, packaging, origins, image URL. Field selection to trim the object. |
 | `off_search_products` | Search by name/keyword plus structured filters: category, brand, label, nutrition_grade (a–e), nova_group, allergen-free, country. Returns summary fields + barcodes for follow-up. Discovery path when the barcode is unknown. |
 | `off_compare_products` | Side-by-side comparison of N barcodes → table of calories, sugar, salt, fat, protein, fiber, Nutri-Score, NOVA. "Which of these three cereals is healthiest?" |
 | `off_browse_taxonomy` | Resolve human terms to canonical tag IDs and browse facet vocabularies (categories, labels, allergens, additives). "plant-based milk" → `en:plant-based-milks`. Builds precise search filters. |

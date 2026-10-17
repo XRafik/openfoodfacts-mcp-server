@@ -29,7 +29,7 @@
 
 ## Overview
 
-Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ products. Look up items by barcode, search by text, tags, allergens, and nutrient thresholds, compare products side by side, and resolve everyday terms to the canonical tags the filters take. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ products. Look up items by barcode, search by text, tags, allergens, and nutrient thresholds, compare products side by side, and resolve everyday terms to the canonical tags the filters take.
 
 ### Tools
 
@@ -52,16 +52,15 @@ Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ product
 
 ### `off_search_products` <sub>tool</sub>
 
-- `query` (up to 24 words; every word except common stop words must match the name, generic name, categories, labels, or brand, and a hyphen or other punctuation between words separates them, so `milk-chocolate` requires both) plus tag filters `categories_tag`, `brands_tag`, `labels_tag` (up to 10, all must apply), `allergens_tag`, `traces_tag`, `ingredients_analysis_tag`, `additives_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, the `exclude_allergens` / `exclude_traces` lists (up to 14 each), and up to 18 `nutrient_filters` (per 100 g, or per 100 ml for liquids), all combined as AND; `page_size` (default 20) up to 50 per call, with a larger value up to 10,000 served at 50 and flagged in `page_size_capped` while `page` counts pages of 50; optional `sort_by`
-- Summary rows carry `barcode`, `product_name`, `brands`, `nutriscore_grade`, `nova_group`, `ecoscore_grade`, and `categories_tags`, alongside `total`, `total_is_lower_bound`, `page_size`, `last_page`, and `omitted`; `truncated` marks a page with more matches beyond it, never the final page; responses using an exclusion carry `exclusion_coverage`, since products with no allergen data entered pass it
-- With `nutrient_filters`, each row also carries `indexed_nutriments`: the text index's values for the constrained nutrients (per 100 g, or per 100 ml for liquids), keyed like `off_get_product` (`sugars_100g`, `energy_kcal_100g`). They are the values the filters were checked against and can differ from the current record `off_get_product` returns
-- `query` or `nutrient_filters` routes the search to a text index that lags the live database (flagged in `text_index_snapshot`), serves only the first 10,000 results, and rejects `additives_tag` as `additives_filter_needs_tag_search`; tag-only searches read the live database through page 10, and a page past either bound fails as `page_out_of_range`
+- `query` (up to 24 words, all of which must match the name, generic name, categories, labels, or brand; punctuation separates words, so `milk-chocolate` requires both) plus the tag filters `categories_tag`, `brands_tag`, `labels_tag` (up to 10), `allergens_tag`, `traces_tag`, `ingredients_analysis_tag`, `additives_tag`, `nutrition_grade`, `nova_group`, `countries_tag`, the `exclude_allergens` / `exclude_traces` lists (up to 14 each), and up to 18 `nutrient_filters` (per 100 g, or per 100 ml for liquids), all combined as AND; optional `sort_by`
+- `page_size` defaults to 20 and is served at up to 50 per call; a larger value (up to 10,000) is served at 50 and flagged in `page_size_capped`, and `page` counts pages of 50. Rows carry `barcode`, `product_name`, `brands`, `nutriscore_grade`, `nova_group`, `ecoscore_grade`, and `categories_tags`, plus `total`, `total_is_lower_bound`, `last_page`, `omitted`, and `truncated` (more matches beyond this page). Exclusions add `exclusion_coverage`, since products with no allergen data entered pass them; `nutrient_filters` add `indexed_nutriments` (the index values the filters checked, which can differ from `off_get_product`)
+- `query` or `nutrient_filters` searches a text index that lags the live database (flagged in `text_index_snapshot`), reaches only the first 10,000 results, and rejects `additives_tag` as `additives_filter_needs_tag_search`; tag-only searches read the live database through page 10. A page past either limit fails as `page_out_of_range`
 
 ---
 
 ### `off_compare_products` <sub>tool</sub>
 
-- 2–100 `barcodes`, returned one row each in input order; a repeated barcode is compared once (two identical barcodes yield one row), and those past the 10th distinct one are listed in `unprocessed` without being fetched
+- 2–100 `barcodes`, one row each in input order; repeated barcodes are compared once, and those past the 10th distinct one are listed in `unprocessed` without being fetched
 - Rows carry `found`, `nutriscore_grade`, `nova_group`, `ecoscore_grade`, energy, fat, saturated fat, sugars, salt, protein, and fiber (per 100 g, or per 100 ml for liquids), and `completeness`; missing values stay absent, never imputed
 - `not_found` lists barcodes with no contributor record and `failed` lists fetches that failed, each with a `reason`; a failed barcode gets no row and never blocks the rest
 
@@ -69,9 +68,9 @@ Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ product
 
 ### `off_browse_taxonomy` <sub>tool</sub>
 
-- `facet` is one of `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`; `search` matches a substring of the tag ID, name, or a synonym ("shellfish" → `en:crustaceans`); `limit` (default 20) up to 100 per call, with a larger value up to 200 returning the first 100; a cut names how many matched and whether a larger `limit` or a narrower term reaches the rest; no paging
+- `facet` is one of `categories`, `labels`, `allergens`, `additives`, `countries`, `nova_groups`, `nutrition_grades`; `search` matches a substring of the tag ID, name, or a synonym ("shellfish" → `en:crustaceans`); `limit` (default 20) returns up to 100 per call (a value up to 200 still returns 100); a cut result says how many matched; no paging
 - Returns `tags[]` of `id` and `name`, where `id` goes to `off_search_products` unchanged; `nova_groups` and `nutrition_grades` come back complete with `total_in_facet`
-- The five open facets resolve against the live Open Food Facts taxonomy and fall back to a small offline sample, with a `notice`, when it is unreachable, gives no usable answer, or the budget is spent; omitting `search` returns only that sample
+- The five open facets resolve against the live Open Food Facts taxonomy and fall back to a small offline sample, with a `notice`, when it is unavailable; omitting `search` returns only that sample
 
 ## Features
 
@@ -80,17 +79,17 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Open Food Facts-specific:
 
 - No API key; the identifying `User-Agent` Open Food Facts' terms require is built in
-- Per-endpoint request budgets (product 15/min, search 10/min, taxonomy 10/min), counted per upstream attempt; transient failures (5xx other than 501, timeouts, 429 with `Retry-After`) retry up to 4 attempts, while a 4xx or 501 is sent once
-- Nutriments normalized from hyphenated keys (`energy-kcal_100g` → `energy_kcal_100g`), with named macros plus `additional_100g` / `additional_serving` maps that label each nutrient with the unit Open Food Facts normalizes it to (g, kJ, kcal, % vol, %, mmol/l, or none for pH and glycemic index)
-- Tag filters take canonical IDs (`en:organic`, `en:no-gluten`); on text searches a case variant, synonym, or brand name is canonicalized before it is sent (`US` → `en:united-states`, `Nutella` → `nutella`)
-- Every field is contributor-entered, so a missing one means not yet recorded rather than absent from the product; Nutri-Score, NOVA, and Green-Score are Open Food Facts' own computed grades, returned as-is, and carry regional formula caveats
+- Per-endpoint request budgets (product 15/min, search 10/min, taxonomy 10/min); transient failures retry up to 4 attempts
+- Nutriments normalized from hyphenated keys (`energy-kcal_100g` → `energy_kcal_100g`), with `additional_100g` / `additional_serving` maps that label each nutrient with its unit
+- Tag filters take canonical IDs (`en:organic`, `en:no-gluten`); on text searches a case variant, synonym, or brand name is canonicalized first (`US` → `en:united-states`)
+- Every field is contributor-entered, so a missing one means not yet recorded; Nutri-Score, NOVA, and Green-Score are Open Food Facts' own computed grades, returned as-is, and carry regional formula caveats
 
 Agent-friendly output:
 
 - Per-serving nutrition carries its denominator: `serving_size`, `serving_quantity`, `serving_quantity_unit`, and a note when none is recorded
 - Graceful partial failure: `off_compare_products` returns resolved rows alongside `not_found` and `failed`
-- Explicit count bounds: `total_is_lower_bound`, `last_page`, and `omitted` on searches, and an exhausted page is reported as such rather than as zero matches
-- Typed failures: each carries a declared `reason` (`upstream_error`, `upstream_timeout`, `upstream_rejected`, `rate_limited`, plus per-tool input reasons) and a recovery hint on both client surfaces; a success response missing its result fields is a retryable `upstream_error` (a `failed` entry on `off_compare_products`; the noticed offline fallback on `off_browse_taxonomy`), never a confident empty result or a not-found
+- Explicit count bounds: `total_is_lower_bound`, `last_page`, and `omitted` on searches
+- Typed failures: each carries a declared `reason` (`upstream_error`, `upstream_timeout`, `upstream_rejected`, `rate_limited`, plus per-tool input reasons) and a recovery hint; an incomplete upstream response is a retryable `upstream_error`, never an empty result or a not-found
 
 ## Getting started
 

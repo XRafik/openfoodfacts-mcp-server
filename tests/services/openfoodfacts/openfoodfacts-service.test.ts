@@ -2299,7 +2299,7 @@ describe('OpenFoodFactsService', () => {
       ],
     ])('extracts words in linear time from %s', (_label, make) => {
       // The query reaches the word scan with no length bound — only its word count is capped.
-      /** Fastest of several samples, each repeated until it has used about 20 ms of CPU. */
+      /** Five CPU-time samples; short batches leave room for scheduling within the test deadline. */
       const cpuMsPerRun = (input: string): number => {
         let fastest = Number.POSITIVE_INFINITY;
         for (let sample = 0; sample < 5; sample++) {
@@ -2311,7 +2311,7 @@ describe('OpenFoodFactsService', () => {
             runs++;
             const used = process.threadCpuUsage(start);
             usedMs = (used.user + used.system) / 1000;
-          } while (usedMs < 20);
+          } while (usedMs < 5);
           fastest = Math.min(fastest, usedMs / runs);
         }
         return fastest;

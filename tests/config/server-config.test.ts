@@ -6,6 +6,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+/** Load the framework dependency graph during collection, outside an individual test's deadline. */
+import '@/config/server-config.js';
 
 /** Every env var the config reads. Cleared per case so a caller's shell cannot colour a default. */
 const CONFIG_ENV_VARS = [

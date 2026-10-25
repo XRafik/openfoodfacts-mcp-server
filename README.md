@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -95,18 +95,40 @@ Agent-friendly output:
 
 ### Public Hosted Instance
 
-A public instance is available at `https://openfoodfacts.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+A public instance is available at `https://openfoodfacts.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
+
+For Claude Code:
+
+```sh
+claude mcp add --transport http openfoodfacts-mcp-server https://openfoodfacts.caseyjhand.com/mcp
+```
+
+For Cline (`cline_mcp_settings.json`):
 
 ```json
 {
   "mcpServers": {
     "openfoodfacts-mcp-server": {
-      "type": "streamable-http",
+      "type": "streamableHttp",
       "url": "https://openfoodfacts.caseyjhand.com/mcp"
     }
   }
 }
 ```
+
+For Cursor (`mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "openfoodfacts-mcp-server": {
+      "url": "https://openfoodfacts.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+Claude Desktop adds remote servers under Customize → Connectors.
 
 ### Self-Hosted / Local
 

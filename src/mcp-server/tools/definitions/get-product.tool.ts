@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
 import { getOpenFoodFactsService } from '@/services/openfoodfacts/openfoodfacts-service.js';
 import {
   BARCODE_PATTERN,
@@ -13,7 +14,7 @@ import {
   type RawNutriments,
   type RawProduct,
 } from '@/services/openfoodfacts/types.js';
-import { mdCodeFence, mdInline, mdUrl } from '@/utils/markdown.js';
+import { mdCodeFence, mdInline } from '@/utils/markdown.js';
 
 /**
  * Fields a requested field needs to be readable, fetched alongside it. Open Food Facts returns
@@ -867,7 +868,7 @@ export const offGetProductTool = tool('off_get_product', {
     }
 
     // Image
-    if (p.image_url) lines.push(`\n**Image:** ${mdUrl(p.image_url)}`);
+    if (p.image_url) lines.push(`\n${markdownImage('Product image', p.image_url)}`);
 
     // Completeness
     if (p.completeness !== undefined) {

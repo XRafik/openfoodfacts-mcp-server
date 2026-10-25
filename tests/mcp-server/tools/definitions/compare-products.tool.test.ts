@@ -1095,12 +1095,12 @@ describe('off_compare_products', () => {
     // Escaped backslash-first, a pipe after backslashes keeps an odd run ahead of it and stays
     // escaped; escaped pipe-first, the backslash escapes would pair off and leave a bare delimiter.
     it.each([
-      ['a pipe or a newline', 'Acme | Co\nBrands', 'Acme \\| Co Brands', 'Acme | Co Brands'],
+      ['a pipe or a newline', 'Acme | Co\nBrands', 'Acme \\| Co Brands', 'Acme \\| Co Brands'],
       [
         'a backslash before a pipe and one at its end',
         'Acme \\| Co\\',
         'Acme \\\\\\| Co\\\\',
-        'Acme \\\\| Co\\\\',
+        'Acme \\\\\\| Co\\\\',
       ],
     ])(
       'keeps a brand carrying %s inside its cell and on the note line',

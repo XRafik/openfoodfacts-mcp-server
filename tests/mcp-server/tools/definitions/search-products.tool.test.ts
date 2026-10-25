@@ -1530,7 +1530,7 @@ describe('off_search_products', () => {
       const text = firstText(offSearchProductsTool.format!(output));
 
       expect(text).toContain('\\*bold\\*');
-      expect(text).toContain('a\\_b');
+      expect(text).toContain('a_b');
       expect(text).toContain('en:x\\`y\\`');
       expect(text.split('\n').filter((line) => line.startsWith('#'))).toHaveLength(1);
       expect(output.products[0]?.brands).toBe('*bold*');

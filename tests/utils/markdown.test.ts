@@ -7,12 +7,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { mdCodeFence, mdInline, mdInlineCode, mdTableCell, mdUrl } from '@/utils/markdown.js';
+import { mdCodeFence, mdInline, mdInlineCode } from '@/utils/markdown.js';
 
 describe('mdInline', () => {
   it('escapes the characters that open structure inside a line', () => {
     expect(mdInline('*bold* _em_ [link] `code` <tag> back\\slash')).toBe(
-      '\\*bold\\* \\_em\\_ \\[link\\] \\`code\\` \\<tag> back\\\\slash',
+      '\\*bold\\* \\_em\\_ \\[link\\] \\`code\\` \\<tag> back\\slash',
     );
   });
 
@@ -26,34 +26,47 @@ describe('mdInline', () => {
   });
 
   it('leaves ordinary values untouched', () => {
-    for (const value of ['Nutella', 'en:organic', '28 g', 'Ferrero, Nutella']) {
+    for (const value of [
+      'Nutella',
+      'en:organic',
+      '28 g',
+      'Ferrero, Nutella',
+      'snake_case',
+      'AT&T',
+    ]) {
       expect(mdInline(value)).toBe(value);
     }
   });
+
+  it('escapes entity references, strikethrough, and line-leading structure', () => {
+    expect(mdInline('&copy; ~~brand~~ | extra')).toBe('\\&copy; \\~\\~brand\\~\\~ \\| extra');
+    expect(mdInline('# heading')).toBe('\\# heading');
+    expect(mdInline('  brand  ')).toBe('&#32;&#32;brand&#32;&#32;');
+  });
 });
 
-describe('mdTableCell', () => {
+describe('mdInline in table cells', () => {
   it('escapes a pipe so a value cannot add a column', () => {
-    expect(mdTableCell('A | B')).toBe('A \\| B');
+    expect(mdInline('A | B')).toBe('A \\| B');
   });
 
   it('collapses a line break so a value cannot end its row', () => {
-    expect(mdTableCell('Line\nBreak')).toBe('Line Break');
+    expect(mdInline('Line\nBreak')).toBe('Line Break');
   });
 
   it('applies the inline escapes as well', () => {
-    expect(mdTableCell('*A* | `B`')).toBe('\\*A\\* \\| \\`B\\`');
+    expect(mdInline('*A* | `B`')).toBe('\\*A\\* \\| \\`B\\`');
   });
 
   it('escapes a backslash before the pipe pass, so a value cannot re-open its own pipe', () => {
-    // Order is load-bearing: the inline pass doubles every backslash first, so the pipe escape it
-    // adds afterwards can never be neutralized by a backslash the value itself carried.
-    expect(mdTableCell('a\\|b')).toBe('a\\\\\\|b');
-    expect(mdTableCell('\\')).toBe('\\\\');
+    // The framework escapes a backslash before punctuation and then the pipe itself, so the
+    // value's backslash cannot neutralize the pipe escape and open another table column.
+    expect(mdInline('a\\|b')).toBe('a\\\\\\|b');
+    expect(mdInline('\\')).toBe('\\\\');
   });
 
   it('leaves an ordinary cell untouched', () => {
-    expect(mdTableCell('Nutella (Ferrero)')).toBe('Nutella (Ferrero)');
+    expect(mdInline('Nutella (Ferrero)')).toBe('Nutella (Ferrero)');
   });
 });
 
@@ -90,19 +103,5 @@ describe('mdInlineCode', () => {
 
   it('collapses a line break inside the span', () => {
     expect(mdInlineCode('en:a\nen:b')).toBe('`en:a en:b`');
-  });
-});
-
-describe('mdUrl', () => {
-  it('collapses line breaks without escaping the URL', () => {
-    expect(mdUrl('https://images.example.test/front_fr.4.400.jpg')).toBe(
-      'https://images.example.test/front_fr.4.400.jpg',
-    );
-    expect(mdUrl('https://example.test/a\n# heading')).toBe('https://example.test/a # heading');
-  });
-
-  it('percent-encodes a less-than so the URL cannot open inline HTML', () => {
-    // `<` is never legal unencoded in a URL, so encoding it is lossless for any real link.
-    expect(mdUrl('https://example.test/<img src=x>')).toBe('https://example.test/%3Cimg src=x>');
   });
 });

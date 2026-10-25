@@ -11,7 +11,7 @@ import {
   BARCODE_PATTERN_MESSAGE,
   type RawProduct,
 } from '@/services/openfoodfacts/types.js';
-import { mdInline, mdTableCell } from '@/utils/markdown.js';
+import { mdInline } from '@/utils/markdown.js';
 
 /** Fields needed for comparison — narrower than full product fetch. */
 const COMPARE_FIELDS =
@@ -134,16 +134,17 @@ function zeroFoundSummary(notFound: string[], failed: readonly { reason: string 
 
 /**
  * A row's text label: `name (brand)`, else `Barcode N (brand)`, else `Barcode N`. Names and brands
- * are contributor-edited, so each is escaped for the context the label lands in — a table cell or
- * an inline note. One helper for every label keeps a brand-only row, or two same-name rows, from
+ * are contributor-edited, so each is escaped for both table cells and inline notes.
+ * One helper for every label keeps a brand-only row, or two same-name rows, from
  * reading differently from one table to the next.
  */
-function rowLabel(
-  row: { barcode: string; product_name?: string | undefined; brands?: string | undefined },
-  escapeFor: (value: string) => string,
-): string {
-  const label = row.product_name ? escapeFor(row.product_name) : `Barcode ${row.barcode}`;
-  return row.brands ? `${label} (${escapeFor(row.brands)})` : label;
+function rowLabel(row: {
+  barcode: string;
+  product_name?: string | undefined;
+  brands?: string | undefined;
+}): string {
+  const label = row.product_name ? mdInline(row.product_name) : `Barcode ${row.barcode}`;
+  return row.brands ? `${label} (${mdInline(row.brands)})` : label;
 }
 
 /** Build a comparison row from a raw product. */
@@ -456,15 +457,14 @@ export const offCompareProductsTool = tool('off_compare_products', {
     lines.push('| Product | Barcode | Found | Nutri-Score | NOVA | Eco-Score | Completeness |');
     lines.push('|:--------|:--------|:------|:------------|:-----|:----------|:-------------|');
     for (const p of result.products) {
-      const name = rowLabel(p, mdTableCell);
+      const name = rowLabel(p);
       // The exact scalar rides alongside the rounded percentage: 0.7875 and 0.79 both render as
       // "79%", and a text-only client has no second call that would recover the difference.
       const completeness =
         p.completeness !== undefined
           ? `${Math.round(p.completeness * 100)}% (${p.completeness})`
           : 'N/A';
-      const grade = (value: string | undefined) =>
-        value === undefined ? 'N/A' : mdTableCell(value);
+      const grade = (value: string | undefined) => (value === undefined ? 'N/A' : mdInline(value));
       lines.push(
         `| ${name} | ${p.barcode} | ${p.found} | ${grade(p.nutriscore_grade)} | ${p.nova_group ?? 'N/A'} | ${grade(p.ecoscore_grade)} | ${completeness} |`,
       );
@@ -479,7 +479,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
       '|:--------|:-------------|:--------|:-------------|:-----------|:---------|:------------|:----------|',
     );
     for (const p of found) {
-      const name = rowLabel(p, mdTableCell);
+      const name = rowLabel(p);
       const fmt = (v: number | undefined) => (v !== undefined ? String(v) : 'N/A');
       lines.push(
         `| ${name} | ${fmt(p.energy_kcal_100g)} | ${fmt(p.fat_100g)} | ${fmt(p.saturated_fat_100g)} | ${fmt(p.sugars_100g)} | ${fmt(p.salt_100g)} | ${fmt(p.proteins_100g)} | ${fmt(p.fiber_100g)} |`,
@@ -492,7 +492,7 @@ export const offCompareProductsTool = tool('off_compare_products', {
     );
     if (lowCompleteness.length > 0) {
       lines.push(
-        `\n*Low completeness (< 50%): ${lowCompleteness.map((p) => rowLabel(p, mdInline)).join(', ')} — many fields may be missing.*`,
+        `\n*Low completeness (< 50%): ${lowCompleteness.map(rowLabel).join(', ')} — many fields may be missing.*`,
       );
     }
 

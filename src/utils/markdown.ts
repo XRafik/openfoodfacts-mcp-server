@@ -9,13 +9,7 @@
  * @module utils/markdown
  */
 
-import { markdown } from '@cyanheads/mcp-ts-core/utils';
-
-/**
- * Characters that open Markdown structure inside a line. The backslash is escaped first, so an
- * escape this function adds is never itself re-escaped by the same pass.
- */
-const INLINE_METACHARACTERS = /[\\`*_[\]<]/g;
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
 
 /** Any line break, including the CRLF pair, collapsed as one unit rather than two. */
 const LINE_BREAKS = /\r\n|[\r\n]/g;
@@ -26,15 +20,7 @@ const LINE_BREAKS = /\r\n|[\r\n]/g;
  * would otherwise end the line it was given and start structure of its own.
  */
 export function mdInline(value: string): string {
-  return value.replace(LINE_BREAKS, ' ').replace(INLINE_METACHARACTERS, '\\$&');
-}
-
-/**
- * Escape a value rendered inside a GFM table cell. A bare pipe adds a column and a line break ends
- * the row, so both are neutralized before the inline escapes apply.
- */
-export function mdTableCell(value: string): string {
-  return mdInline(value).replace(/\|/g, '\\|');
+  return escapeMarkdownInline(value.replace(LINE_BREAKS, ' '));
 }
 
 /**
@@ -59,14 +45,4 @@ export function mdInlineCode(value: string): string {
   if (longestRun === 0) return `\`${text}\``;
   const delimiter = '`'.repeat(longestRun + 1);
   return `${delimiter} ${text} ${delimiter}`;
-}
-
-/**
- * Neutralize a URL rendered as a bare value. The inline escapes are deliberately not applied: an
- * escaped underscore would leave a backslash inside a link a reader copies out. A line break is the
- * one character that can open block structure, so it collapses to a space, and `<` — never legal
- * unencoded in a URL, but able to open inline HTML — is percent-encoded, which is lossless.
- */
-export function mdUrl(value: string): string {
-  return value.replace(LINE_BREAKS, ' ').replace(/</g, '%3C');
 }

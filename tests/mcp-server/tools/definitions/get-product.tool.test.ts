@@ -1060,7 +1060,7 @@ describe('off_get_product', () => {
     expect(text).toContain('\\[click\\](https://example.invalid)');
     expect(text).toContain('1 \\`unit\\`');
     expect(text).toContain('\\<g>');
-    expect(text).toContain('a\\_b');
+    expect(text).toContain('a_b');
     expect(text).toContain('en:\\`x\\`');
     expect(text).toContain('calcium\\*');
     // The tag's newline must not open a heading of its own — the tag stays on the categories line.
@@ -1091,6 +1091,27 @@ describe('off_get_product', () => {
     expect(text).toContain('28 g');
     expect(text).toContain('en:organic');
   });
+
+  it.each([
+    [
+      'https://images.example.test/front_(1).jpg',
+      '![Product image](<https://images.example.test/front_(1).jpg>)',
+    ],
+    ['javascript:alert(1)', 'Product image (javascript:alert(1))'],
+    ['https://example.test/a\n# heading', 'Product image (https://example.test/a\\\n\\# heading)'],
+    [
+      'https://example.test/<img src=x>',
+      '![Product image](<https://example.test/\\<img src=x\\>>)',
+    ],
+  ])(
+    'renders the image URL %s without changing the structured value',
+    async (image_url, rendered) => {
+      mockGetProduct.mockResolvedValue({ product_name: 'Image', image_url });
+      const result = await runToolContract(offGetProductTool, { barcode: '12345678' });
+      expect(result.structuredContent).toMatchObject({ product: { image_url } });
+      expect(contractText(result)).toContain(rendered);
+    },
+  );
 
   // ── #9: content[] must carry the same arrays as structuredContent ──────────
 
@@ -1481,7 +1502,7 @@ describe('off_get_product', () => {
       const text = firstText(offGetProductTool.format!(output));
 
       expect(text).toContain('  - \\[click\\](https://example.invalid) (id: en:\\`x\\`)');
-      expect(text).toContain('    - \\*bold\\* # heading (id: en:a\\_b)');
+      expect(text).toContain('    - \\*bold\\* # heading (id: en:a_b)');
       expect(text.split('\n').some((line) => line.startsWith('# heading'))).toBe(false);
     });
   });
@@ -1807,9 +1828,9 @@ describe('off_get_product', () => {
         calcium_prepared: { value: 0.252, unit: 'g' },
       });
       const text = contractText(result);
-      expect(text).toContain('energy\\_kcal\\_prepared: 68 kcal');
-      expect(text).toContain('energy\\_kj\\_prepared: 287 kJ');
-      expect(text).toContain('calcium\\_prepared: 0.252 g');
+      expect(text).toContain('energy_kcal_prepared: 68 kcal');
+      expect(text).toContain('energy_kj_prepared: 287 kJ');
+      expect(text).toContain('calcium_prepared: 0.252 g');
     });
 
     it('renders pH with no unit and alcohol in % vol', () => {

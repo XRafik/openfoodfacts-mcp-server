@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.9](changelog/0.3.x/0.3.9.md) — 2026-10-25
+
+Product text and images render through the shared Markdown helpers.
+
 ## [0.3.8](changelog/0.3.x/0.3.8.md) — 2026-10-13
 
 Open Food Facts read fixes: text search treats punctuation inside a word as part of it, malformed upstream bodies fail as retryable upstream_error, liquids are labeled per 100 ml, and over-cap page_size, barcodes, and limit are served bounded instead of rejected.

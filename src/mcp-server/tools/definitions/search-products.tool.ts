@@ -820,7 +820,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       if (moreBeyond) {
         ctx.enrich.truncated({ shown: response.page_count, cap: pageSize, guidance: notice });
       } else {
-        ctx.enrich({ notice });
+        ctx.enrich.notice(notice);
       }
     } else if (response.products.length === 0 && response.count > 0) {
       // An empty page inside a positive result set is an exhausted page, not a zero-match search.
@@ -831,11 +831,10 @@ export const offSearchProductsTool = tool('off_search_products', {
           ? `The backend stopped counting at ${response.count} matches, so there is no exact last page — request an earlier page.`
           : `Request page ${lastPage} or lower to reach them.`;
 
-      ctx.enrich({
-        notice:
-          `Page ${response.page} is past the end of this result set — ${response.count} matching ` +
+      ctx.enrich.notice(
+        `Page ${response.page} is past the end of this result set — ${response.count} matching ` +
           `products exist, but no page this deep holds any. ${bound}`,
-      });
+      );
     } else if (response.products.length === 0) {
       // Echoed as given but trimmed, and only when sent: a blank value never reaches a backend.
       const filterParts: string[] = [];
@@ -862,9 +861,9 @@ export const offSearchProductsTool = tool('off_search_products', {
 
       const echo = `No products found for ${filterParts.join(', ')}.`;
       if (!servedByTextBackend) {
-        ctx.enrich({
-          notice: `${echo} Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.`,
-        });
+        ctx.enrich.notice(
+          `${echo} Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.`,
+        );
       } else {
         // A text-path zero has three possible causes, and the caller needs the ones that apply to
         // this search named: a word no product carries, a tag value matched exactly, and index
@@ -898,7 +897,7 @@ export const offSearchProductsTool = tool('off_search_products', {
         causes.push(
           `The text index may not hold recently contributed products, so an empty result here does not settle whether a matching product has been contributed: ${liveRoute.advice}, or call off_get_product when the barcode is known.`,
         );
-        ctx.enrich({ notice: `${echo} ${causes.join(' ')}` });
+        ctx.enrich.notice(`${echo} ${causes.join(' ')}`);
       }
     } else if (moreBeyond) {
       // Disclose when matches exist past this page. A final page — every match up to the total

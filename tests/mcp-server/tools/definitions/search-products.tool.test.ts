@@ -162,6 +162,34 @@ describe('off_search_products', () => {
     expect(typeof enrichment.notice).toBe('string');
   });
 
+  it('renders the empty-result notice as prose, echoing the query as sent', async () => {
+    // A query carrying Markdown-active characters. The notice must render as a blockquote
+    // (the zero-match trailer's kind) with the query unescaped, and structuredContent.notice
+    // must carry the query exactly as the caller sent it — not the escaped form the bold-label
+    // trailer arm produced.
+    mockSearch({
+      count: 0,
+      page: 1,
+      page_count: 0,
+      page_size: 20,
+      products: [],
+    });
+
+    const result = await runToolContract(offSearchProductsTool, {
+      query: 'zz`y_*q',
+      page: 1,
+      page_size: 20,
+    });
+
+    const text = contractText(result);
+    expect(text).toContain('> No products found for query="zz`y_*q"');
+    expect(text).not.toContain('**notice:**');
+    expect(text).not.toContain('\\`');
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(String(structured.notice ?? '')).toMatch(/^No products found for query="zz`y_\*q"\./);
+  });
+
   it('passes tag filter parameters to the service', async () => {
     mockSearch({
       count: 5,

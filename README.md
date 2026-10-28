@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.9-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.9-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openfoodfacts-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openfoodfacts-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openfoodfacts-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -39,6 +39,12 @@ Packaged-food data from Open Food Facts, a crowd-sourced database of 3M+ product
 | `off_search_products` | Search by text, tag filters, allergen exclusions, and nutrient thresholds (per 100 g, or per 100 ml for liquids); returns summary rows with barcodes |
 | `off_compare_products` | Compare up to 10 products per call by barcode on nutrition (per 100 g, or per 100 ml for liquids), Nutri-Score, NOVA, and Green-Score |
 | `off_browse_taxonomy` | Resolve a human term to the canonical tag ID that `off_search_products` filters on |
+
+### Skills
+
+| Skill | Description |
+|:------|:------------|
+| `openfoodfacts-guide` | Judgment for calling the tools: allergy checks that never overclaim, choosing among a product's barcodes, where tag IDs come from, grade ranges, free-from searches, and the shared search budget. Served over MCP as `skill://openfoodfacts-guide/SKILL.md` and shipped in the plugin, npm package, and `.mcpb` bundle. |
 
 ## Capability reference
 
@@ -93,137 +99,32 @@ Agent-friendly output:
 
 ## Getting started
 
-### Public Hosted Instance
-
-A public instance is available at `https://openfoodfacts.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
-
-For Claude Code:
+Connect to the hosted instance, no install:
 
 ```sh
 claude mcp add --transport http openfoodfacts-mcp-server https://openfoodfacts.caseyjhand.com/mcp
 ```
 
-For Cline (`cline_mcp_settings.json`):
+Or run it locally:
 
-```json
-{
-  "mcpServers": {
-    "openfoodfacts-mcp-server": {
-      "type": "streamableHttp",
-      "url": "https://openfoodfacts.caseyjhand.com/mcp"
-    }
-  }
-}
+```sh
+claude mcp add openfoodfacts-mcp-server -- npx -y @cyanheads/openfoodfacts-mcp-server
 ```
 
-For Cursor (`mcp.json`):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "openfoodfacts-mcp-server": {
-      "url": "https://openfoodfacts.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-Claude Desktop adds remote servers under Customize → Connectors.
-
-### Self-Hosted / Local
-
-No API key is required. Add the following to your MCP client configuration file.
-
-```json
-{
-  "mcpServers": {
-    "openfoodfacts-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/openfoodfacts-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
-```
-
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "openfoodfacts-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/openfoodfacts-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/openfoodfacts-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "openfoodfacts-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "ghcr.io/cyanheads/openfoodfacts-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- No API key or account. Open Food Facts asks clients to identify themselves, and the server's `User-Agent` does so without configuration.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/openfoodfacts-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd openfoodfacts-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env if you need to override rate limits or the base URL
-```
+No API key or account is needed: the server identifies itself to Open Food Facts with its own `User-Agent`. For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -245,6 +146,16 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ## Running the server
 
 ### Local development
+
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+- **Clone and install:**
+
+  ```sh
+  git clone https://github.com/cyanheads/openfoodfacts-mcp-server.git
+  cd openfoodfacts-mcp-server && bun install
+  cp .env.example .env   # optional: override rate limits or the base URL
+  ```
 
 - **Build and run:**
 
@@ -269,22 +180,22 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ### Docker
 
 ```sh
-docker build -t openfoodfacts-mcp-server .
-docker run --rm -p 3010:3010 openfoodfacts-mcp-server
+docker run --rm -p 3010:3010 ghcr.io/cyanheads/openfoodfacts-mcp-server:latest
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/openfoodfacts-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/openfoodfacts-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/openfoodfacts-mcp-server:latest"]`. To build locally, `docker build -t openfoodfacts-mcp-server .`; OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 
 | Directory | Purpose |
 |:----------|:--------|
-| `src/index.ts` | `createApp()` entry point — registers tools and inits services. |
+| `src/index.ts` | `createApp()` entry point — registers tools and the published skills, and inits services. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/services/openfoodfacts` | Open Food Facts API client — HTTP, rate limiting, retry, field normalization. |
 | `src/services/taxonomy` | Tag vocabulary — live resolution, offline sample, and tag-value canonicalization. |
 | `src/utils` | Markdown escaping for contributor-entered values in text output. |
+| `skills/` | Published Agent Skills for the agents that call the tools. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide

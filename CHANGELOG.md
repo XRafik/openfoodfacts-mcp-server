@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-28
+
+Publishes the openfoodfacts-guide Agent Skill over MCP, renders search notices as block quotes with escaped caller text, and moves to mcp-ts-core 0.13.18 (MCP SDK 2.4; a 0.13.16 HTTP per-request memory leak fixed).
+
 ## [0.3.9](changelog/0.3.x/0.3.9.md) — 2026-10-25
 
 Product text and images render through the shared Markdown helpers.

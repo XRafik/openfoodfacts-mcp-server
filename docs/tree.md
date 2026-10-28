@@ -1,6 +1,6 @@
 # openfoodfacts-mcp-server - Directory Structure
 
-Generated on: 2026-10-13 14:19:14
+Generated on: 2026-10-28 07:41:39
 
 ```text
 openfoodfacts-mcp-server/
@@ -27,6 +27,7 @@ openfoodfacts-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -39,6 +40,8 @@ openfoodfacts-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -136,6 +139,9 @@ openfoodfacts-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── openfoodfacts-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -206,7 +212,9 @@ openfoodfacts-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

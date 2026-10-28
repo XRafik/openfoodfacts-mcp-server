@@ -480,10 +480,12 @@ export const offSearchProductsTool = tool('off_search_products', {
     cap: z.number().optional().describe('The page_size that was applied.'),
   },
 
+  // These fields are authored prose, not values a caller copies into its next call, so each renders
+  // as a labelled sentence; the framework's default for a string field is a code span.
   enrichmentTrailer: {
-    text_index_snapshot: { label: 'Index freshness' },
-    exclusion_coverage: { label: 'Exclusions' },
-    page_size_capped: { label: 'Page size' },
+    text_index_snapshot: { render: (v) => `**Index freshness:** ${mdInline(String(v))}` },
+    exclusion_coverage: { render: (v) => `**Exclusions:** ${mdInline(String(v))}` },
+    page_size_capped: { render: (v) => `**Page size:** ${mdInline(String(v))}` },
   },
 
   errors: [
@@ -820,7 +822,7 @@ export const offSearchProductsTool = tool('off_search_products', {
       if (moreBeyond) {
         ctx.enrich.truncated({ shown: response.page_count, cap: pageSize, guidance: notice });
       } else {
-        ctx.enrich({ notice });
+        ctx.enrich.notice(notice);
       }
     } else if (response.products.length === 0 && response.count > 0) {
       // An empty page inside a positive result set is an exhausted page, not a zero-match search.
@@ -831,16 +833,16 @@ export const offSearchProductsTool = tool('off_search_products', {
           ? `The backend stopped counting at ${response.count} matches, so there is no exact last page — request an earlier page.`
           : `Request page ${lastPage} or lower to reach them.`;
 
-      ctx.enrich({
-        notice:
-          `Page ${response.page} is past the end of this result set — ${response.count} matching ` +
+      ctx.enrich.notice(
+        `Page ${response.page} is past the end of this result set — ${response.count} matching ` +
           `products exist, but no page this deep holds any. ${bound}`,
-      });
+      );
     } else if (response.products.length === 0) {
-      // Echoed as given but trimmed, and only when sent: a blank value never reaches a backend.
+      // Echoed as given but trimmed, and only when sent: a blank value never reaches a backend. A
+      // notice is authored Markdown, so each caller value inside it is escaped.
       const filterParts: string[] = [];
       const pushEcho = (label: string, value: string | readonly string[] | undefined) => {
-        for (const entry of tagValues(value)) filterParts.push(`${label}="${entry}"`);
+        for (const entry of tagValues(value)) filterParts.push(`${label}="${mdInline(entry)}"`);
       };
       pushEcho('query', query);
       pushEcho('category', input.categories_tag);
@@ -862,9 +864,9 @@ export const offSearchProductsTool = tool('off_search_products', {
 
       const echo = `No products found for ${filterParts.join(', ')}.`;
       if (!servedByTextBackend) {
-        ctx.enrich({
-          notice: `${echo} Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.`,
-        });
+        ctx.enrich.notice(
+          `${echo} Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.`,
+        );
       } else {
         // A text-path zero has three possible causes, and the caller needs the ones that apply to
         // this search named: a word no product carries, a tag value matched exactly, and index
@@ -879,7 +881,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           const fieldName = /([\p{L}_]+):/u.exec(query)?.[1];
           if (fieldName) {
             causes.push(
-              `query is matched as words, never as field:value syntax, so "${fieldName}" had to match as a word as well; put a field constraint in its filter input instead (brands_tag, categories_tag, nutrition_grade, …).`,
+              `query is matched as words, never as field:value syntax, so "${mdInline(fieldName)}" had to match as a word as well; put a field constraint in its filter input instead (brands_tag, categories_tag, nutrition_grade, …).`,
             );
           }
         }
@@ -887,7 +889,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           const unconfirmed = tagFilters.flatMap(({ label, given, sent, canonical }) =>
             canonical?.resolution === 'normalized'
               ? [
-                  `${label}="${given}"${sent === given ? '' : ` was sent as "${sent}"`} (${UNCONFIRMED_TAG_REASONS[canonical.reason]})`,
+                  `${label}="${mdInline(given)}"${sent === given ? '' : ` was sent as "${mdInline(sent)}"`} (${UNCONFIRMED_TAG_REASONS[canonical.reason]})`,
                 ]
               : [],
           );
@@ -898,7 +900,7 @@ export const offSearchProductsTool = tool('off_search_products', {
         causes.push(
           `The text index may not hold recently contributed products, so an empty result here does not settle whether a matching product has been contributed: ${liveRoute.advice}, or call off_get_product when the barcode is known.`,
         );
-        ctx.enrich({ notice: `${echo} ${causes.join(' ')}` });
+        ctx.enrich.notice(`${echo} ${causes.join(' ')}`);
       }
     } else if (moreBeyond) {
       // Disclose when matches exist past this page. A final page — every match up to the total

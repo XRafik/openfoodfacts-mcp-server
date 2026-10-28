@@ -1177,7 +1177,7 @@ describe('OpenFoodFactsService', () => {
 
     it('bounds a JSON detail string and strips its markup from the message', async () => {
       // The JSON branch is the one search-a-licious actually answers with; a detail string is
-      // still upstream-authored text and lands in the taxonomy fallback notice unescaped.
+      // still upstream-authored text and lands in the taxonomy fallback notice.
       const ctx = createMockContext({ errors: offGetProductTool.errors });
       const detail = `<b>rejected</b> ${'because '.repeat(60)}`;
       global.fetch = vi.fn().mockResolvedValue(mockResponse({ detail }, 400));

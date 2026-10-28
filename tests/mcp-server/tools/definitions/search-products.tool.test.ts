@@ -162,6 +162,26 @@ describe('off_search_products', () => {
     expect(typeof enrichment.notice).toBe('string');
   });
 
+  it('escapes the caller query echoed in the empty-result notice', async () => {
+    mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+    await offSearchProductsTool.handler({ query: 'dark *choc* [x]', page: 1, page_size: 20 }, ctx);
+
+    // The notice is authored Markdown, so the query's emphasis and link syntax is escaped there.
+    expect(String(getEnrichment(ctx).notice)).toContain('query="dark \\*choc\\* \\[x\\]"');
+  });
+
+  it('renders the prose enrichment fields as labelled sentences, not code spans', () => {
+    const trailer = offSearchProductsTool.enrichmentTrailer;
+    const sentence = 'page_size 80 is above the 50 results one call returns.';
+
+    expect(trailer?.page_size_capped?.render?.(sentence)).toBe(`**Page size:** ${sentence}`);
+    expect(trailer?.exclusion_coverage?.render?.(sentence)).toBe(`**Exclusions:** ${sentence}`);
+    expect(trailer?.text_index_snapshot?.render?.(sentence)).toBe(
+      `**Index freshness:** ${sentence}`,
+    );
+  });
+
   it('passes tag filter parameters to the service', async () => {
     mockSearch({
       count: 5,
@@ -2902,6 +2922,137 @@ describe('off_search_products', () => {
     it('says what happens above the cap in the page_size description', () => {
       expect(inputDescription('page_size')).toMatch(/served at 50/);
       expect(inputDescription('page')).toMatch(/page 2 at page_size 80 is results 51–100/);
+    });
+  });
+
+  // ── #65: every notice renders as a blockquote in the content[] trailer ────
+
+  describe('notice trailer rendering (#65)', () => {
+    /** The blockquote lines of a rendered content[] text. */
+    function quoteLines(text: string): string[] {
+      return text.split('\n').filter((line) => line.startsWith('> '));
+    }
+
+    // Characterization — the truncated path already writes its notice through the kind-tagged
+    // helper, so it renders as a blockquote; the fix brings the other notices into line with it.
+    it('renders the truncation notice as a blockquote', async () => {
+      mockSearch({
+        count: 42,
+        page: 1,
+        page_count: 1,
+        page_size: 20,
+        products: [{ code: '1234567890001', product_name: 'Hummus' }],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page: 1,
+        page_size: 20,
+      });
+
+      const notice = (result.structuredContent as Record<string, unknown>).notice;
+      expect(notice).toBe('Page 1 of 3. Use the page parameter to fetch subsequent pages.');
+      const text = contractText(result);
+      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      expect(text).not.toContain('**notice:**');
+    });
+
+    it('renders the text-path zero-match notice as a blockquote with the query escaped', async () => {
+      mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'zz`y_*q',
+        page: 1,
+        page_size: 20,
+      });
+
+      // The notice is authored Markdown shared by both surfaces, so structuredContent carries the
+      // same escaped echo the blockquote renders.
+      const notice = String((result.structuredContent as Record<string, unknown>).notice ?? '');
+      expect(notice.startsWith('No products found for query="zz\\`y\\_\\*q". ')).toBe(true);
+      expect(notice).toContain('Every word of query must match');
+
+      const text = contractText(result);
+      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      expect(text).not.toContain('**notice:**');
+      expect(text).not.toMatch(/`+No products found/);
+    });
+
+    it('renders the tag-only zero-match notice as a blockquote with the tag escaped', async () => {
+      mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:x_*y',
+        page: 1,
+        page_size: 20,
+      });
+
+      const notice = (result.structuredContent as Record<string, unknown>).notice;
+      expect(notice).toBe(
+        'No products found for category="en:x\\_\\*y". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
+      );
+      const text = contractText(result);
+      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      expect(text).not.toContain('**notice:**');
+    });
+
+    it('renders the past-the-end notice as a blockquote', async () => {
+      mockSearch({ count: 163, page: 5, page_count: 0, page_size: 50, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        categories_tag: 'en:hummus',
+        page: 5,
+        page_size: 50,
+      });
+
+      const notice = (result.structuredContent as Record<string, unknown>).notice;
+      expect(notice).toBe(
+        'Page 5 is past the end of this result set — 163 matching products exist, but no page this deep holds any. Request page 4 or lower to reach them.',
+      );
+      const text = contractText(result);
+      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      expect(text).not.toContain('**notice:**');
+    });
+
+    it('renders the past-the-end notice of a clipped count as a blockquote', async () => {
+      mockSearch({
+        count: 10000,
+        count_is_exact: false,
+        page: 500,
+        page_count: 0,
+        page_size: 20,
+        products: [],
+      });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'chocolate',
+        page: 500,
+        page_size: 20,
+      });
+
+      const notice = String((result.structuredContent as Record<string, unknown>).notice ?? '');
+      expect(notice).toMatch(/^Page 500 is past the end .* no exact last page/);
+      const text = contractText(result);
+      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      expect(text).not.toContain('**notice:**');
+    });
+
+    it('renders the all-omitted final-page notice as a blockquote', async () => {
+      mockSearch({ count: 1, page: 1, page_count: 0, page_size: 5, dropped: 1, products: [] });
+
+      const result = await runToolContract(offSearchProductsTool, {
+        query: 'miel',
+        page: 1,
+        page_size: 5,
+      });
+
+      const notice = String((result.structuredContent as Record<string, unknown>).notice ?? '');
+      expect(notice).toMatch(
+        /^Page 1 lists no products: .* No further page of matches can be requested\.$/,
+      );
+      const text = contractText(result);
+      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      expect(text).not.toContain('**notice:**');
     });
   });
 

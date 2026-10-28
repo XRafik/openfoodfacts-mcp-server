@@ -1,0 +1,31 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openfoodfacts-mcp-server",
+  "version": "0.3.9",
+  "description": "Look up food products by barcode, search by keyword, tag, allergen, or nutrition filter, compare products side-by-side, and browse the canonical tag vocabulary via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/openfoodfacts-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/openfoodfacts-mcp-server.git",
+  "license": "Apache-2.0",
+  "keywords": [
+    "openfoodfacts",
+    "food",
+    "nutrition",
+    "barcode",
+    "nutriscore",
+    "nova",
+    "ingredients",
+    "allergens",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http"
+  ]
+}

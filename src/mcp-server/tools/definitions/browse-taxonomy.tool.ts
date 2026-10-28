@@ -94,6 +94,12 @@ export const offBrowseTaxonomyTool = tool('off_browse_taxonomy', {
       .describe(`The limit that was applied — at most ${TAXONOMY_LIMIT_CAP}.`),
   },
 
+  // The notice echoes the search term and an upstream failure cause, so it is escaped here at render
+  // time: structuredContent keeps those values as sent.
+  enrichmentTrailer: {
+    notice: { render: (v) => `> ${mdInline(String(v))}` },
+  },
+
   async handler(input, ctx) {
     const svc = getTaxonomyService();
     const limit = Math.min(input.limit, TAXONOMY_LIMIT_CAP);

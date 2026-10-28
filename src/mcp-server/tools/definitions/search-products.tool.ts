@@ -480,9 +480,12 @@ export const offSearchProductsTool = tool('off_search_products', {
     cap: z.number().optional().describe('The page_size that was applied.'),
   },
 
-  // These fields are authored prose, not values a caller copies into its next call, so each renders
-  // as a labelled sentence; the framework's default for a string field is a code span.
+  // These fields are authored prose, not values a caller copies into its next call, so the notice
+  // renders as a block quote and the rest as labelled sentences; the framework's default for a
+  // string field is a code span. The prose echoes caller and upstream values, so it is escaped here
+  // at render time: structuredContent keeps those values as sent.
   enrichmentTrailer: {
+    notice: { render: (v) => `> ${mdInline(String(v))}` },
     text_index_snapshot: { render: (v) => `**Index freshness:** ${mdInline(String(v))}` },
     exclusion_coverage: { render: (v) => `**Exclusions:** ${mdInline(String(v))}` },
     page_size_capped: { render: (v) => `**Page size:** ${mdInline(String(v))}` },
@@ -838,11 +841,10 @@ export const offSearchProductsTool = tool('off_search_products', {
           `products exist, but no page this deep holds any. ${bound}`,
       );
     } else if (response.products.length === 0) {
-      // Echoed as given but trimmed, and only when sent: a blank value never reaches a backend. A
-      // notice is authored Markdown, so each caller value inside it is escaped.
+      // Echoed as given but trimmed, and only when sent: a blank value never reaches a backend.
       const filterParts: string[] = [];
       const pushEcho = (label: string, value: string | readonly string[] | undefined) => {
-        for (const entry of tagValues(value)) filterParts.push(`${label}="${mdInline(entry)}"`);
+        for (const entry of tagValues(value)) filterParts.push(`${label}="${entry}"`);
       };
       pushEcho('query', query);
       pushEcho('category', input.categories_tag);
@@ -881,7 +883,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           const fieldName = /([\p{L}_]+):/u.exec(query)?.[1];
           if (fieldName) {
             causes.push(
-              `query is matched as words, never as field:value syntax, so "${mdInline(fieldName)}" had to match as a word as well; put a field constraint in its filter input instead (brands_tag, categories_tag, nutrition_grade, …).`,
+              `query is matched as words, never as field:value syntax, so "${fieldName}" had to match as a word as well; put a field constraint in its filter input instead (brands_tag, categories_tag, nutrition_grade, …).`,
             );
           }
         }
@@ -889,7 +891,7 @@ export const offSearchProductsTool = tool('off_search_products', {
           const unconfirmed = tagFilters.flatMap(({ label, given, sent, canonical }) =>
             canonical?.resolution === 'normalized'
               ? [
-                  `${label}="${mdInline(given)}"${sent === given ? '' : ` was sent as "${mdInline(sent)}"`} (${UNCONFIRMED_TAG_REASONS[canonical.reason]})`,
+                  `${label}="${given}"${sent === given ? '' : ` was sent as "${sent}"`} (${UNCONFIRMED_TAG_REASONS[canonical.reason]})`,
                 ]
               : [],
           );

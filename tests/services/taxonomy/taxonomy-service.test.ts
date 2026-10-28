@@ -518,25 +518,6 @@ describe('TaxonomyService — caller cancellation (#60)', () => {
   });
 });
 
-describe('TaxonomyService.search notices', () => {
-  const globalFetch = global.fetch;
-
-  afterEach(() => {
-    global.fetch = globalFetch;
-    vi.restoreAllMocks();
-  });
-
-  it('escapes the caller term echoed in the no-match notice', async () => {
-    stubOptions([]);
-
-    const result = await makeTaxonomy().search('labels', '*zq* [x]', 20, createMockContext());
-
-    expect(result.tags).toEqual([]);
-    // The notice is authored Markdown, so the term's emphasis and link syntax is escaped there.
-    expect(result.notice).toContain('No labels tag matched "\\*zq\\* \\[x\\]"');
-  });
-});
-
 describe('slugTagValue', () => {
   it('keeps letters outside ASCII and lowercases them', () => {
     expect(slugTagValue('ÉPICERIE Fine')).toBe('épicerie-fine');

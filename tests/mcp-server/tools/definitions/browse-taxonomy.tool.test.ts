@@ -1118,4 +1118,17 @@ describe('off_browse_taxonomy', () => {
       );
     });
   });
+
+  it('echoes the term as sent in structuredContent and escaped in the content[] notice', async () => {
+    const result = await runToolContract(offBrowseTaxonomyTool, {
+      facet: 'labels',
+      search: '*zq* [x]',
+      limit: 20,
+    });
+
+    const notice = String((result.structuredContent as Record<string, unknown>).notice);
+    expect(notice).toContain('No labels tag matched "*zq* [x]"');
+    // The rendered notice escapes the term's emphasis and link syntax, so it reads back as sent.
+    expect(contractText(result)).toContain('> No labels tag matched "\\*zq\\* \\[x\\]"');
+  });
 });

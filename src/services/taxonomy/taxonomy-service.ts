@@ -12,7 +12,6 @@ import {
   getOpenFoodFactsService,
   MAX_AUTOCOMPLETE_SIZE,
 } from '@/services/openfoodfacts/openfoodfacts-service.js';
-import { mdInline } from '@/utils/markdown.js';
 
 export type TaxonomyEntry = {
   id: string;
@@ -662,14 +661,13 @@ export class TaxonomyService {
         term,
         error: cause,
       });
-      // A notice is authored Markdown, so the upstream-derived cause inside it is escaped.
       return {
         facet,
         tags: offline.slice(0, limit).map(toTag),
         matched_in_facet: offline.length,
         notice:
           `The live Open Food Facts ${facet} vocabulary could not be reached or gave no usable answer ` +
-          `(${mdInline(cause)}). These ${offline.length} result(s) come ` +
+          `(${cause}). These ${offline.length} result(s) come ` +
           `from this server's offline sample of ${embedded.length} entries, so a term the sample does not ` +
           'cover reads as no match here even when the tag exists upstream. Retry for an authoritative answer.',
       };
@@ -701,7 +699,7 @@ export class TaxonomyService {
       matched_in_facet: merged.length,
       ...(merged.length === 0 && {
         notice:
-          `No ${facet} tag matched "${mdInline(term)}" in the Open Food Facts vocabulary. Matching is on whole words in ` +
+          `No ${facet} tag matched "${term}" in the Open Food Facts vocabulary. Matching is on whole words in ` +
           'the tag name, so try a single simpler word (e.g. "hummus" rather than "hummus dip"); note also that ' +
           'many category tags are plural upstream ("kombucha" resolves to en:kombuchas).',
       }),

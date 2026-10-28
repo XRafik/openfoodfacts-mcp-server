@@ -162,13 +162,21 @@ describe('off_search_products', () => {
     expect(typeof enrichment.notice).toBe('string');
   });
 
-  it('escapes the caller query echoed in the empty-result notice', async () => {
+  it('echoes the caller query as sent in structuredContent and escaped in content[]', async () => {
     mockSearch({ count: 0, page: 1, page_count: 0, page_size: 20, products: [] });
 
-    await offSearchProductsTool.handler({ query: 'dark *choc* [x]', page: 1, page_size: 20 }, ctx);
+    const result = await runToolContract(offSearchProductsTool, {
+      query: 'dark *choc* [x]',
+      page: 1,
+      page_size: 20,
+    });
 
-    // The notice is authored Markdown, so the query's emphasis and link syntax is escaped there.
-    expect(String(getEnrichment(ctx).notice)).toContain('query="dark \\*choc\\* \\[x\\]"');
+    const notice = String((result.structuredContent as Record<string, unknown>).notice ?? '');
+    expect(notice).toContain('query="dark *choc* [x]"');
+    // The rendered notice escapes the query's emphasis and link syntax, so it reads back as sent.
+    expect(contractText(result)).toContain(
+      '> No products found for query="dark \\*choc\\* \\[x\\]"',
+    );
   });
 
   it('renders the prose enrichment fields as labelled sentences, not code spans', () => {
@@ -2966,14 +2974,16 @@ describe('off_search_products', () => {
         page_size: 20,
       });
 
-      // The notice is authored Markdown shared by both surfaces, so structuredContent carries the
-      // same escaped echo the blockquote renders.
+      // structuredContent echoes the query as sent; the blockquote escapes it.
       const notice = String((result.structuredContent as Record<string, unknown>).notice ?? '');
-      expect(notice.startsWith('No products found for query="zz\\`y\\_\\*q". ')).toBe(true);
+      expect(notice.startsWith('No products found for query="zz`y_*q". ')).toBe(true);
       expect(notice).toContain('Every word of query must match');
 
       const text = contractText(result);
-      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      const quoted = quoteLines(text);
+      expect(quoted).toHaveLength(1);
+      expect(quoted[0]?.startsWith('> No products found for query="zz\\`y\\_\\*q". ')).toBe(true);
+      expect(quoted[0]).toContain('Every word of query must match');
       expect(text).not.toContain('**notice:**');
       expect(text).not.toMatch(/`+No products found/);
     });
@@ -2989,10 +2999,12 @@ describe('off_search_products', () => {
 
       const notice = (result.structuredContent as Record<string, unknown>).notice;
       expect(notice).toBe(
-        'No products found for category="en:x\\_\\*y". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
+        'No products found for category="en:x_*y". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
       );
       const text = contractText(result);
-      expect(quoteLines(text)).toEqual([`> ${notice}`]);
+      expect(quoteLines(text)).toEqual([
+        '> No products found for category="en:x\\_\\*y". Try broader terms, check tag IDs via off_browse_taxonomy, or remove some filters.',
+      ]);
       expect(text).not.toContain('**notice:**');
     });
 
